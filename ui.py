@@ -101,21 +101,13 @@ with st.sidebar:
     st.caption(f"Бэкенд: `{API_BASE}`")
 
     if st.button("Синхронизация", use_container_width=True, type="primary"):
-        with st.spinner(
-            "Скачиваем Excel, парсим доступные CV и обновляем ИИ-векторы..."
-        ):
+        with st.spinner("Отправка команды на сервер..."):
             try:
                 res = _api_post("/sync-excel")
                 if res.ok:
                     data = res.json()
                     if data.get("status") == "success":
-                        stats = data.get("stats", {})
-                        st.success(
-                            f"**База успешно обновлена!**\n\n"
-                            f"Новых строк в таблице: {stats.get('updated_submissions', 0)}\n\n"
-                            f"Скачано текстов открытых CV: {stats.get('downloaded_cv_texts', 0)}\n\n"
-                            f"Распарсено чистых стеков: {stats.get('successfully_parsed_stacks', 0)}"
-                        )
+                        st.success(f"**{data.get('message')}**")
                     else:
                         st.error(f"Ошибка бэкенда: {data.get('message')}")
                 else:
@@ -162,16 +154,13 @@ if st.button("Начать поиск", type="primary"):
                         "target_broker": target_broker.strip(),
                     },
                 )
-                if resp.ok:
-                    _render_search_results(
-                        resp.json(),
-                        q,
-                        target_client=target_client.strip(),
-                        target_broker=target_broker.strip(),
-                        fuzzy=True,
-                    )
-                else:
-                    st.error(f"Ошибка ИИ-поиска: {resp.status_code}")
+                if res.ok:
+                    data = res.json()
+                    if data.get("status") == "success":
+                        st.success(f"**{data.get('message')}**")
+                        st.info("Вы можете продолжать работу с поиском, пока база обновляется в фоновом режиме.")
+                    else:
+                        st.error(f"Ошибка бэкенда: {data.get('message')}")
 
             elif fuzzy_enabled:
                 keywords = _extract_keywords(q)

@@ -40,14 +40,14 @@ _(База данных и необходимые расширения созд�
 
 ```bash
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --reload --port 8000
 
 ```
 
 **5. Запустите Интерфейс (Сайт):** Откройте второй терминал и выполните:
 
 ```bash
-streamlit run ui.py
+python -m streamlit run ui.py
 
 ```
 

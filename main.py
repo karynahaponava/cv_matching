@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 import requests
 import numpy as np
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, BackgroundTasks
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -110,31 +110,19 @@ def root():
     return {"status": "ok"}
 
 
-@app.post("/sync-excel")
-def sync_excel():
-    """Ручная синхронизация: качает таблицу, скачивает тексты CV (через Google API) и парсит стек"""
+def process_cvs_in_background():
+    """Фоновая задача только для тяжелой работы: скачивание текстов, парсинг и нейросеть"""
     session = SessionLocal()
     try:
-        print("\n" + "=" * 60)
-        print("[Ручная синхронизация] Старт общего процесса обработки...")
-        print("=" * 60)
-
-        print("\n[Синхронизация] Шаг 1: Скачивание строк из Google Sheets...")
-        stats = sync_candidates_from_cloud(session)
-        print(f"✅ Шаг 1 завершен. Статистика: {stats}")
-        
-        print("\n[Синхронизация] Шаг 2: Скачивание текстов доступных CV...")
+        print("\n[Фоновая задача] Шаг 2: Скачивание текстов доступных CV...")
         candidates = session.query(Candidate).filter(
             (Candidate.cv_text == None) | (Candidate.cv_text == "")
         ).all()
         
         total_cvs = len(candidates)
-        print(f"Найдено {total_cvs} кандидатов без текста резюме.")
-        
         updated_texts = 0
         for i, cand in enumerate(candidates, 1):
             if not cand.cv_url or "docs.google.com" not in cand.cv_url:
-                print(f" [{i}/{total_cvs}] Пропуск (нет ссылки Google Docs): {cand.name}")
                 continue
             
             print(f" [{i}/{total_cvs}] Скачивание CV для: {cand.name}...", end="", flush=True)
@@ -153,67 +141,71 @@ def sync_excel():
         session.commit()
         print(f"✅ Шаг 2 завершен. Успешно скачано: {updated_texts}")
 
-        print("\n[Синхронизация] Шаг 3: Извлечение стека только из текста резюме...")
+        print("\n[Фоновая задача] Шаг 3: Извлечение стека только из текста резюме...")
         all_candidates = session.query(Candidate).filter(
             Candidate.cv_text.is_not(None),
             Candidate.cv_text != ""
         ).all()
         
-        total_parse = len(all_candidates)
         parsed_stacks = 0
-        for i, c in enumerate(all_candidates, 1):
-            print(f" [{i}/{total_parse}] Парсинг текста для {c.name}...", end="", flush=True)
+        for c in all_candidates:
             data = extract_all_from_text(c.cv_text)
             if data["stack"] and data["stack"].strip():
                 c.stack = data["stack"]
                 c.seniority = data["seniority"] or c.seniority
                 c.direction = data["direction"] or c.direction
                 parsed_stacks += 1
-                print(f" ✅ Найдено: {c.stack[:40]}...")
             else:
                 c.stack = "Стек не распознан (требуется ручная проверка)"
-                print(" ⚠️ Стек не найден")
                 
         session.commit()
         print(f"✅ Шаг 3 завершен. Обновлено стеков: {parsed_stacks}")
         
-        print("\n[Синхронизация] Шаг 4: Обновление ИИ-векторов...")
+        print("\n[Фоновая задача] Шаг 4: Обновление ИИ-векторов...")
         candidates_to_embed = session.query(Candidate).all()
-        total_embed = len(candidates_to_embed)
         embed_stats = {"updated": 0}
         
-        for i, c in enumerate(candidates_to_embed, 1):
+        for c in candidates_to_embed:
             text_to_embed = f"{c.stack or ''}\n{c.cv_text or ''}".strip()
             if text_to_embed:
-                print(f" [{i}/{total_embed}] Расчет ИИ-вектора для {c.name}...", end="", flush=True)
                 try:
                     vector = embed(text_to_embed)
                     c.embedding = np.array(vector, dtype=np.float32).tobytes()
                     embed_stats["updated"] += 1
-                    print(" ✅ Готово")
-                except Exception as e:
-                    print(f" ❌ Ошибка ии: {e}")
-            else:
-                print(f" [{i}/{total_embed}] Пропуск (нет данных): {c.name}")
+                except Exception:
+                    pass
                 
         session.commit()
         print(f"✅ Шаг 4 завершен. Обновлено векторов: {embed_stats['updated']}")
         print("\n" + "=" * 60)
-        print("[Синхронизация] Все шаги успешно выполнены!")
+        print("[Фоновая задача] Все шаги успешно выполнены!")
         print("=" * 60 + "\n")
+
+    except Exception as e:
+        session.rollback()
+        print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА В ФОНЕ: {e}")
+    finally:
+        session.close()
+
+
+@app.post("/sync-excel")
+def sync_excel(background_tasks: BackgroundTasks):
+    session = SessionLocal()
+    try:
+        print("\n" + "=" * 60)
+        print("[Синхронизация] Шаг 1: Скачивание строк из Google Sheets...")
+        stats = sync_candidates_from_cloud(session)
+        print(f"✅ Шаг 1 завершен. Статистика: {stats}")
+
+        background_tasks.add_task(process_cvs_in_background)
 
         return {
             "status": "success", 
-            "stats": {
-                "added_candidates": stats.get("added_candidates", 0),
-                "updated_submissions": stats.get("updated_submissions", 0),
-                "downloaded_cv_texts": updated_texts,
-                "successfully_parsed_stacks": parsed_stacks
-            }
+            "message": f"Таблица успешно загружена (Новых кандидатов: {stats.get('added_candidates', 0)}). Обработка резюме и ИИ-поиска запущена в фоновом режиме!"
         }
     except Exception as e:
         session.rollback()
-        print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        print(f"\n❌ ОШИБКА ДОСТУПА ИЛИ СКАЧИВАНИЯ: {e}")
         return {"status": "error", "message": str(e)}
     finally:
         session.close()

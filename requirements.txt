@@ -11,4 +11,6 @@ google-api-python-client
 streamlit
 requests
 python-dotenv
-watchdog
+apscheduler
+numpy
+sentence-transformers

@@ -1,8 +1,10 @@
 import os
 import io
+import re
 import pandas as pd
-import requests
 from datetime import datetime
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 def sync_candidates_from_cloud(session):
     try:
@@ -10,8 +12,26 @@ def sync_candidates_from_cloud(session):
         if not spreadsheet_url:
             raise Exception("SPREADSHEET_URL не задан в .env файле")
 
-        response = requests.get(spreadsheet_url, timeout=30)
-        df = pd.read_excel(io.BytesIO(response.content))
+        match = re.search(r"/d/([a-zA-Z0-9-_]+)", spreadsheet_url)
+        if not match:
+            raise Exception("Не удалось извлечь ID таблицы из ссылки SPREADSHEET_URL")
+        file_id = match.group(1)
+
+        creds_path = os.getenv("GOOGLE_CREDS_PATH")
+        if not creds_path:
+            raise Exception("GOOGLE_CREDS_PATH не задан в .env файле")
+            
+        creds = service_account.Credentials.from_service_account_file(
+            creds_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        raw_data = service.files().export(
+            fileId=file_id, 
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ).execute()
+
+        df = pd.read_excel(io.BytesIO(raw_data))
         df = df.fillna("")
 
         if "Candidate" not in df.columns or "Link" not in df.columns:
