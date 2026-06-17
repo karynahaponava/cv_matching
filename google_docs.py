@@ -1,6 +1,8 @@
 import os
 import re
-
+import io
+import docx
+from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -81,6 +83,30 @@ def _fetch_via_drive_export(doc_id: str, credentials) -> str:
             return raw.decode("utf-8").strip()
         return str(raw).strip()
 
+    elif mime_type == "application/pdf":
+        request = service.files().get_media(fileId=doc_id)
+        file_content = request.execute()
+        reader = PdfReader(io.BytesIO(file_content))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip()
+
+    elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        request = service.files().get_media(fileId=doc_id)
+        file_content = request.execute()
+        doc = docx.Document(io.BytesIO(file_content))
+        
+        full_text = [p.text for p in doc.paragraphs]
+        
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        full_text.append(cell.text.strip())
+                        
+        return "\n".join(full_text)
+
     return ""
 
 
@@ -89,13 +115,16 @@ def get_doc_text(doc_url: str) -> str:
     if not doc_id:
         return ""
 
+    credentials = _get_credentials()
+
     try:
-        credentials = _get_credentials()
-        text = _fetch_via_docs_api(doc_id, credentials)
+        text = _fetch_via_drive_export(doc_id, credentials)
         if text:
             return text
-        return _fetch_via_drive_export(doc_id, credentials)
-    except (HttpError, ValueError, OSError, FileNotFoundError):
-        return ""
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Ошибка Drive API для {doc_id}: {e}")
+
+    try:
+        return _fetch_via_docs_api(doc_id, credentials)
+    except Exception as e:
         return ""

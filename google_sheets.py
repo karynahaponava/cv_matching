@@ -6,6 +6,7 @@ from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+
 def sync_candidates_from_cloud(session):
     try:
         spreadsheet_url = os.getenv("SPREADSHEET_URL")
@@ -20,16 +21,20 @@ def sync_candidates_from_cloud(session):
         creds_path = os.getenv("GOOGLE_CREDS_PATH")
         if not creds_path:
             raise Exception("GOOGLE_CREDS_PATH не задан в .env файле")
-            
+
         creds = service_account.Credentials.from_service_account_file(
             creds_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
         )
 
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        raw_data = service.files().export(
-            fileId=file_id, 
-            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ).execute()
+        raw_data = (
+            service.files()
+            .export(
+                fileId=file_id,
+                mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            .execute()
+        )
 
         df = pd.read_excel(io.BytesIO(raw_data))
         df = df.fillna("")
@@ -40,7 +45,9 @@ def sync_candidates_from_cloud(session):
         from models import Candidate, Submission, Vacancy
 
         added_cand_count = 0
+        updated_cand_count = 0
         added_sub_count = 0
+        updated_sub_count = 0
         skipped_count = 0
 
         for _, row in df.iterrows():
@@ -53,7 +60,23 @@ def sync_candidates_from_cloud(session):
 
             req_title = str(row.get("Request", "")).strip()
             req_desc = str(row.get("Request description", "")).strip()
-            combined_stack = f"{req_title} {req_desc}".strip()
+
+            raw_date = row.get("Date")
+            if pd.isna(raw_date) or not str(raw_date).strip():
+                for col_name in row.keys():
+                    if str(col_name).strip() == "Date":
+                        raw_date = row[col_name]
+                        break
+
+            submitted_at = None
+            if raw_date:
+                try:
+                    submitted_at = pd.to_datetime(
+                        raw_date, dayfirst=True
+                    ).to_pydatetime()
+                except Exception as e:
+                    print(f"Ошибка парсинга даты '{raw_date}' для {name}: {e}")
+                    submitted_at = None
 
             vacancy_id = None
             if req_title:
@@ -62,6 +85,9 @@ def sync_candidates_from_cloud(session):
                     vac = Vacancy(title=req_title, requirements=req_desc)
                     session.add(vac)
                     session.flush()
+                else:
+                    if vac.requirements != req_desc:
+                        vac.requirements = req_desc
                 vacancy_id = vac.id
 
             cand = session.query(Candidate).filter(Candidate.cv_url == cv_url).first()
@@ -72,24 +98,30 @@ def sync_candidates_from_cloud(session):
                     direction=req_title,
                     stack="",
                     seniority="",
+                    created_at=submitted_at,
                 )
                 session.add(cand)
                 session.flush()
                 added_cand_count += 1
+            else:
+                cand_updated = False
+                if cand.name != name:
+                    cand.name = name
+                    cand_updated = True
+                if cand.direction != req_title:
+                    cand.direction = req_title
+                    cand_updated = True
+                if submitted_at and cand.created_at != submitted_at:
+                    cand.created_at = submitted_at
+                    cand_updated = True
+
+                if cand_updated:
+                    updated_cand_count += 1
 
             broker = str(row.get("Broker", "")).strip()
             client = str(row.get("Client", "")).strip()
             status = str(row.get("Status", "")).strip()
             req_result = str(row.get("Request result", "")).strip()
-
-            raw_date = row.get("Date")
-            submitted_at = None
-
-            if raw_date:
-                try:
-                    submitted_at = pd.to_datetime(raw_date).to_pydatetime()
-                except Exception:
-                    submitted_at = None
 
             if client or broker or vacancy_id:
                 sub = (
@@ -107,19 +139,20 @@ def sync_candidates_from_cloud(session):
                     db_status = str(sub.status or "").strip()
                     db_req_result = str(sub.request_result or "").strip()
 
-                    if submitted_at:
+                    sub_updated = False
+
+                    if submitted_at and sub.submitted_at != submitted_at:
                         sub.submitted_at = submitted_at
-                        updated = True
-                    updated = False
+                        sub_updated = True
                     if db_status != status:
                         sub.status = status
-                        updated = True
+                        sub_updated = True
                     if db_req_result != req_result:
                         sub.request_result = req_result
-                        updated = True
+                        sub_updated = True
 
-                    if updated:
-                        added_sub_count += 1
+                    if sub_updated:
+                        updated_sub_count += 1
                 else:
                     new_sub = Submission(
                         candidate_id=cand.id,
@@ -137,7 +170,9 @@ def sync_candidates_from_cloud(session):
 
         return {
             "added_candidates": added_cand_count,
-            "updated_submissions": added_sub_count,
+            "updated_candidates": updated_cand_count,
+            "added_submissions": added_sub_count,
+            "updated_submissions": updated_sub_count,
             "skipped_rows": skipped_count,
         }
 

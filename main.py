@@ -1,12 +1,19 @@
 import re
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import requests
 import numpy as np
 from fastapi import FastAPI, Query, BackgroundTasks
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import func, or_
 
 from db import Base, SessionLocal, engine
 from models import Candidate, Submission, Vacancy
@@ -34,14 +41,148 @@ class SemanticMatchRequest(BaseModel):
     target_client: str = ""
     target_broker: str = ""
 
+class AnalyzeRequest(BaseModel):
+    query: str
+    cv_url: str
+
+def update_status(text: str):
+    """Helper function for writing the current status to a file"""
+    with open("sync_status.txt", "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def internal_update_cv_texts(days_limit: int = None):
+    """Downloading resume texts from Google Docs (optional for the last N days)"""
+    session = SessionLocal()
+    updated, skipped, errors = 0, 0, 0
+    try:
+        query = session.query(Candidate).filter(
+            or_(
+                Candidate.cv_text == None,
+                Candidate.cv_text == "",
+                func.length(Candidate.cv_text) < 500,
+            )
+        )
+        if days_limit:
+            limit_date = datetime.utcnow() - timedelta(days=days_limit)
+            query = query.filter(Candidate.created_at >= limit_date)
+
+        candidates = query.all()
+        total = len(candidates)
+        print(
+            f"\n[Парсер CV] Найдено {total} кандидатов для загрузки текста (Лимит дней: {days_limit})..."
+        )
+
+        for i, cand in enumerate(candidates, 1):
+            if not cand.cv_url or "docs.google.com" not in cand.cv_url:
+                skipped += 1
+                continue
+            print(f"[{i}/{total}] Скачивание CV для: {cand.name[:20]}... ", end="")
+            try:
+                cv_text = get_doc_text(cand.cv_url)
+                if cv_text:
+                    cand.cv_text = cv_text
+                    updated += 1
+                    print("✅ УСПЕШНО")
+                else:
+                    errors += 1
+                    print("❌ ОШИБКА (Документ закрыт)")
+            except Exception:
+                errors += 1
+                print("⚠️ ОШИБКА СЕТИ")
+
+            if i % 10 == 0:
+                session.commit()
+        session.commit()
+        return {"updated": updated, "skipped": skipped, "errors": errors}
+    finally:
+        session.close()
+
+
+def internal_parse_cv_stacks(days_limit: int = None):
+    """Parsing stack and directions from texts (optional for the last N days)"""
+    session = SessionLocal()
+    try:
+        query = session.query(Candidate).filter(Candidate.cv_text.is_not(None))
+        if days_limit:
+            limit_date = datetime.utcnow() - timedelta(days=days_limit)
+            query = query.filter(Candidate.created_at >= limit_date)
+
+        candidates = query.all()
+        updated = 0
+        for c in candidates:
+            data = extract_all_from_text(c.cv_text)
+            
+            c.stack = data["stack"] or c.stack
+            c.seniority = data["seniority"] or c.seniority
+            
+            if not c.direction or not c.direction.strip():
+                c.direction = data["direction"]
+                
+            updated += 1
+
+        session.commit()
+        print(f"[Парсер стека] Стек и роли успешно обновлены для {updated} кандидатов.")
+        return {"updated": updated}
+    finally:
+        session.close()
+
+
+def internal_build_embeddings(days_limit: int = None):
+    """Generation of AI vectors (optional for the last N days)"""
+    session = SessionLocal()
+    stats = {"updated": 0, "errors": 0}
+    try:
+        query = session.query(Candidate).filter(Candidate.embedding.is_(None))
+        if days_limit:
+            limit_date = datetime.utcnow() - timedelta(days=days_limit)
+            query = query.filter(Candidate.created_at >= limit_date)
+
+        candidates = query.all()
+        for c in candidates:
+            text = f"{c.stack or ''}\n{c.cv_text or ''}".strip()
+            if text:
+                try:
+                    vector = embed(text)
+                    c.embedding = np.array(vector, dtype=np.float32).tobytes()
+                    stats["updated"] += 1
+                except Exception:
+                    stats["errors"] += 1
+        session.commit()
+        return stats
+    finally:
+        session.close()
+
+
+def process_cvs_in_background(days_limit: int = None):
+    """Full background word processing, parsing and vectorization process"""
+    try:
+        mode_text = f"за последние {days_limit} дня" if days_limit else "для ВСЕЙ базы"
+        update_status(f"Запуск синхронизации ({mode_text}). Шаг 1 завершен.")
+
+        update_status(f"Шаг 2: Скачивание текстов резюме {mode_text}...")
+        res_cv = internal_update_cv_texts(days_limit=days_limit)
+
+        update_status(f"Шаг 3: Анализ стека и извлечение направлений {mode_text}...")
+        res_stack = internal_parse_cv_stacks(days_limit=days_limit)
+
+        update_status(
+            f"Шаг 4: Расчет ИИ-векторов для семантического поиска {mode_text}..."
+        )
+        res_ai = internal_build_embeddings(days_limit=days_limit)
+
+        update_status("🎉 Синхронизация полностью завершена! Все данные актуальны.")
+    except Exception as e:
+        update_status(f"❌ Процесс прерван из-за ошибки: {e}")
+
 
 def nightly_maintenance_job():
-    """A single task that runs all processes strictly in sequence"""
+    """Automatic nightly build: Updates the structure COMPLETELY, but only parses the last 2 days"""
     print("\n" + "=" * 50)
     print(f"Старт ночного обслуживания: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
 
-    print("\nШАГ 1: Синхронизация с Excel...")
+    print("\nШАГ 1: Полная синхронизация структуры и статусов с Excel...")
     session = SessionLocal()
     try:
         stats = sync_candidates_from_cloud(session)
@@ -51,48 +192,21 @@ def nightly_maintenance_job():
     finally:
         session.close()
 
-    print("\nШАГ 2: Скачивание текстов для новых CV (за 2 дня)...")
-    try:
-        res_cv = update_cv_texts()
-        print(f"✅ Статус скачивания CV: {res_cv}")
-    except Exception as e:
-        print(f"❌ Ошибка загрузки CV: {e}")
-
-    print("\nШАГ 3: Парсинг стека технологий из новых текстов...")
-    try:
-        res_stack = parse_cv_stacks()
-        print(f"✅ Статус парсинга: {res_stack}")
-    except Exception as e:
-        print(f"❌ Ошибка парсинга стека: {e}")
-
-    print("\nШАГ 4: Генерация ИИ-векторов для семантического поиска...")
-    try:
-        stats_ai = build_embeddings()
-        print(f"✅ Векторы обновлены: {stats_ai}")
-    except Exception as e:
-        print(f"❌ Ошибка векторизации: {e}")
-
-    print("\n" + "=" * 50)
-    print(
-        f"Обслуживание успешно завершено: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    print("=" * 50 + "\n")
+    process_cvs_in_background(days_limit=2)
+    print("\n" + "=" * 50 + "\n")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
-
     scheduler = BackgroundScheduler()
-
-    scheduler.add_job(nightly_maintenance_job, "cron", hour=4, minute=00)
-
+    scheduler.add_job(
+        nightly_maintenance_job, "cron", hour=1, minute=0, misfire_grace_time=3600
+    )
     scheduler.start()
-    print("⏰ Планировщик запущен! Единая ночная сборка назначена на 04:00.")
-    print("   Очередь: Excel ➡️ Скачивание CV ➡️ Парсинг стека ➡️ Векторы ИИ")
-
+    print("⏰ Планировщик запущен! Единая ночная сборка назначена на 01:00.")
+    print("   Правило: Вся таблица Excel ➡️ Дельта за 2 дня (Тексты, Стек, ИИ-векторы)")
     yield
-
     scheduler.shutdown()
     print("⏰ Планировщик задач остановлен.")
 
@@ -100,92 +214,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def extract_gdoc_id(url: str):
-    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
-    return match.group(1) if match else None
-
-
 @app.get("/")
 def root():
     return {"status": "ok"}
-
-
-def process_cvs_in_background():
-    """Фоновая задача только для тяжелой работы: скачивание текстов, парсинг и нейросеть"""
-    session = SessionLocal()
-    try:
-        print("\n[Фоновая задача] Шаг 2: Скачивание текстов доступных CV...")
-        candidates = session.query(Candidate).filter(
-            (Candidate.cv_text == None) | (Candidate.cv_text == "")
-        ).all()
-        
-        total_cvs = len(candidates)
-        updated_texts = 0
-        for i, cand in enumerate(candidates, 1):
-            if not cand.cv_url or "docs.google.com" not in cand.cv_url:
-                continue
-            
-            print(f" [{i}/{total_cvs}] Скачивание CV для: {cand.name}...", end="", flush=True)
-            try:
-                cv_text = get_doc_text(cand.cv_url)
-                if cv_text:
-                    cand.cv_text = cv_text
-                    updated_texts += 1
-                    print(" ✅ УСПЕШНО")
-                else:
-                    print(" ❌ ОШИБКА (Документ закрыт)")
-            except Exception as e:
-                print(f" ⚠️ ИСКЛЮЧЕНИЕ СЕТИ: {e}")
-                continue
-        
-        session.commit()
-        print(f"✅ Шаг 2 завершен. Успешно скачано: {updated_texts}")
-
-        print("\n[Фоновая задача] Шаг 3: Извлечение стека только из текста резюме...")
-        all_candidates = session.query(Candidate).filter(
-            Candidate.cv_text.is_not(None),
-            Candidate.cv_text != ""
-        ).all()
-        
-        parsed_stacks = 0
-        for c in all_candidates:
-            data = extract_all_from_text(c.cv_text)
-            if data["stack"] and data["stack"].strip():
-                c.stack = data["stack"]
-                c.seniority = data["seniority"] or c.seniority
-                c.direction = data["direction"] or c.direction
-                parsed_stacks += 1
-            else:
-                c.stack = "Стек не распознан (требуется ручная проверка)"
-                
-        session.commit()
-        print(f"✅ Шаг 3 завершен. Обновлено стеков: {parsed_stacks}")
-        
-        print("\n[Фоновая задача] Шаг 4: Обновление ИИ-векторов...")
-        candidates_to_embed = session.query(Candidate).all()
-        embed_stats = {"updated": 0}
-        
-        for c in candidates_to_embed:
-            text_to_embed = f"{c.stack or ''}\n{c.cv_text or ''}".strip()
-            if text_to_embed:
-                try:
-                    vector = embed(text_to_embed)
-                    c.embedding = np.array(vector, dtype=np.float32).tobytes()
-                    embed_stats["updated"] += 1
-                except Exception:
-                    pass
-                
-        session.commit()
-        print(f"✅ Шаг 4 завершен. Обновлено векторов: {embed_stats['updated']}")
-        print("\n" + "=" * 60)
-        print("[Фоновая задача] Все шаги успешно выполнены!")
-        print("=" * 60 + "\n")
-
-    except Exception as e:
-        session.rollback()
-        print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА В ФОНЕ: {e}")
-    finally:
-        session.close()
 
 
 @app.post("/sync-excel")
@@ -193,116 +224,48 @@ def sync_excel(background_tasks: BackgroundTasks):
     session = SessionLocal()
     try:
         print("\n" + "=" * 60)
-        print("[Синхронизация] Шаг 1: Скачивание строк из Google Sheets...")
+        print("[Ручной запуск] Шаг 1: Скачивание всей таблицы из Google Sheets...")
         stats = sync_candidates_from_cloud(session)
         print(f"✅ Шаг 1 завершен. Статистика: {stats}")
 
-        background_tasks.add_task(process_cvs_in_background)
+        background_tasks.add_task(process_cvs_in_background, days_limit=None)
 
         return {
-            "status": "success", 
-            "message": f"Таблица успешно загружена (Новых кандидатов: {stats.get('added_candidates', 0)}). Обработка резюме и ИИ-поиска запущена в фоновом режиме!"
+            "status": "success",
+            "message": f"Таблица успешно загружена (Новых: {stats.get('added_candidates', 0)}). Тотальный перепарсинг ВСЕЙ базы и расчет ИИ-векторов запущены!",
         }
     except Exception as e:
         session.rollback()
-        print(f"\n❌ ОШИБКА ДОСТУПА ИЛИ СКАЧИВАНИЯ: {e}")
         return {"status": "error", "message": str(e)}
     finally:
         session.close()
 
 
 @app.post("/update-cv-texts")
-def update_cv_texts():
-    session = SessionLocal()
-    updated = 0
-    skipped = 0
-    errors = 0
-
-    try:
-        two_days_ago = datetime.utcnow() - timedelta(days=2)
-        candidates = (
-            session.query(Candidate)
-            .filter(
-                (Candidate.cv_text == None) | (Candidate.cv_text == ""),
-                Candidate.created_at >= two_days_ago,
-            )
-            .all()
-        )
-
-        total = len(candidates)
-        print(f"\n[Парсер CV] Найдено {total} новых кандидатов за 2 дня без текста. Начинаю загрузку...")
-
-        for i, cand in enumerate(candidates, 1):
-            if not cand.cv_url or "docs.google.com" not in cand.cv_url:
-                skipped += 1
-                continue
-
-            try:
-                cv_text = get_doc_text(cand.cv_url)
-
-                if cv_text:
-                    cand.cv_text = cv_text
-                    updated += 1
-                    print(f"[{i}/{total}] ✅ Успешно скачан текст: {cand.name}")
-                else:
-                    errors += 1
-                    print(f"[{i}/{total}] ❌ Документ закрыт: {cand.name}")
-            except Exception as e:
-                errors += 1
-                print(f"[{i}/{total}] ⚠️ Ошибка сети: {cand.name}")
-
-            if i % 10 == 0:
-                session.commit()
-
-        session.commit()
-        print(f"\n[Парсер CV] Завершено! Скачано: {updated}, Ошибок: {errors}, Пропущено: {skipped}")
-
-        return {
-            "status": "success",
-            "updated": updated,
-            "skipped": skipped,
-            "errors": errors,
-        }
-
-    except Exception as e:
-        session.rollback()
-        return {"status": "error", "message": str(e)}
-    finally:
-        session.close()
+def update_cv_texts(
+    days_limit: int = Query(None, description="Лимит дней для проверки (None = все)")
+):
+    return internal_update_cv_texts(days_limit=days_limit)
 
 
 @app.post("/parse-cv-stacks")
-def parse_cv_stacks(use_llm: bool = False):
-    """Regex analysis of resume texts and automatic stack and grade completion"""
-    session = SessionLocal()
-    try:
-        candidates = (
-            session.query(Candidate).filter(Candidate.cv_text.is_not(None)).all()
-        )
+def parse_cv_stacks(
+    days_limit: int = Query(None, description="Лимит дней для парсинга (None = все)")
+):
+    return internal_parse_cv_stacks(days_limit=days_limit)
 
-        updated = 0
-        for c in candidates:
-            data = extract_all_from_text(c.cv_text)
 
-            c.stack = data["stack"] or c.stack
-            c.seniority = data["seniority"] or c.seniority
-            c.direction = data["direction"] or c.direction
-
-            updated += 1
-
-        session.commit()
-        print(f"[Парсер стека] Стек успешно обновлен для {updated} кандидатов.")
-        return {"updated": updated}
-    except Exception as e:
-        session.rollback()
-        return {"error": str(e)}
-    finally:
-        session.close()
+@app.post("/build-embeddings")
+def build_embeddings(
+    days_limit: int = Query(
+        None, description="Лимит дней для генерации эмбеддингов (None = все)"
+    )
+):
+    return internal_build_embeddings(days_limit=days_limit)
 
 
 @app.post("/fuzzy-match")
 def fuzzy_match(request: FuzzyMatchRequest):
-    """SQL search (word_similarity) with support for endings and typos"""
     return fuzzy_search_candidates(
         request.keywords,
         request.target_client,
@@ -311,42 +274,18 @@ def fuzzy_match(request: FuzzyMatchRequest):
     )
 
 
-@app.post("/build-embeddings")
-def build_embeddings():
-    """Generating AI vectors for semantic search"""
-    session = SessionLocal()
-    stats = {"updated": 0, "errors": 0}
-    try:
-        candidates = (
-            session.query(Candidate).filter(Candidate.embedding.is_(None)).all()
-        )
-        for c in candidates:
-            text = f"{c.stack or ''}\n{c.cv_text or ''}".strip()
-            if text:
-                vector = embed(text)
-                c.embedding = np.array(vector, dtype=np.float32).tobytes()
-                stats["updated"] += 1
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        stats["errors"] += 1
-    finally:
-        session.close()
-    return stats
-
-
 @app.post("/semantic-match")
 def semantic_match(request: SemanticMatchRequest):
-    """AI search with strict duplicate checking by name and specific resume"""
     session = SessionLocal()
     try:
         query_vec = embed(request.query)
         candidates = (
             session.query(Candidate).filter(Candidate.embedding.is_not(None)).all()
         )
-
-        tc = request.target_client.strip().lower()
-        tb = request.target_broker.strip().lower()
+        tc, tb = (
+            request.target_client.strip().lower(),
+            request.target_broker.strip().lower(),
+        )
         from fuzzy_search import get_candidate_badge
 
         matched_cands = []
@@ -360,19 +299,16 @@ def semantic_match(request: SemanticMatchRequest):
             return []
 
         names = list(set([c.name for c, _ in matched_cands]))
-        
         all_cands = (
             session.query(Candidate.id, Candidate.name, Candidate.cv_url)
             .filter(Candidate.name.in_(names))
             .all()
         )
 
-        name_to_ids = {}
-        id_to_url = {} 
-        
+        name_to_ids, id_to_url = {}, {}
         for c_id, c_name, c_url in all_cands:
             name_to_ids.setdefault(c_name, []).append(c_id)
-            id_to_url[c_id] = c_url 
+            id_to_url[c_id] = c_url
 
         all_ids = [cid for ids in name_to_ids.values() for cid in ids]
         subs = (
@@ -386,9 +322,7 @@ def semantic_match(request: SemanticMatchRequest):
         for c, score in matched_cands:
             c_ids = name_to_ids.get(c.name, [])
             c_subs = [s for s in subs if s.candidate_id in c_ids]
-
             badge_color, badge_text = get_candidate_badge(c.id, c_subs, tc, tb)
-
             results.append(
                 {
                     "id": c.id,
@@ -400,7 +334,6 @@ def semantic_match(request: SemanticMatchRequest):
                     "badge_text": badge_text,
                 }
             )
-
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
     finally:
@@ -409,7 +342,6 @@ def semantic_match(request: SemanticMatchRequest):
 
 @app.get("/search")
 def search(query: str = Query(..., min_length=1)):
-    """Legacy classic search (left for backward compatibility)"""
     session = SessionLocal()
     try:
         candidates = session.query(Candidate).all()
@@ -429,5 +361,83 @@ def search(query: str = Query(..., min_length=1)):
                 )
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
+    finally:
+        session.close()
+
+
+@app.get("/sync-status")
+def get_sync_status():
+    if os.path.exists("sync_status.txt"):
+        with open("sync_status.txt", "r", encoding="utf-8") as f:
+            return {"status": f.read()}
+    return {"status": "Синхронизация еще не запускалась"}
+
+
+@app.post("/analyze-cv")
+def analyze_cv(request: AnalyzeRequest):
+    from embeddings import model, cosine_similarity, embed
+
+    session = SessionLocal()
+    try:
+        cand = (
+            session.query(Candidate)
+            .filter(Candidate.cv_url == request.cv_url.strip())
+            .first()
+        )
+        if not cand or not cand.cv_text:
+            return {"error": "Кандидат не найден или нет текста резюме"}
+
+        cand_stack = cand.stack or "Стек не распарсился"
+        kw_pattern = re.compile(r"[a-zA-Z0-9+#\.\-_/]+")
+        query_kws = list(
+            dict.fromkeys(
+                [w.lower() for w in kw_pattern.findall(request.query) if len(w) >= 2]
+            )
+        )
+        query_stack = ", ".join(query_kws).title() if query_kws else "Не найдено"
+
+        raw_cv_blocks = re.split(r"\n|(?<=[.!?])\s+", cand.cv_text)
+        cv_blocks = [b.strip() for b in raw_cv_blocks if len(b.strip()) > 40]
+        if not cv_blocks:
+            return {"error": "Текст резюме слишком короткий или не читается"}
+
+        cv_vecs = model.encode(cv_blocks).tolist()
+        req_lines = [
+            line.strip() for line in request.query.split("\n") if len(line.strip()) > 15
+        ]
+        if len(req_lines) < 2:
+            req_lines = [
+                s.strip()
+                for s in re.split(r"(?<=[.!?])\s+", request.query)
+                if len(s.strip()) > 15
+            ]
+        req_lines = req_lines[:15]
+
+        matches = []
+        for req in req_lines:
+            req_vec = embed(req)
+            best_score = 0
+            best_block = ""
+            for i, cv_vec in enumerate(cv_vecs):
+                score = cosine_similarity(req_vec, cv_vec) * 100
+                if score > best_score:
+                    best_score = score
+                    best_block = cv_blocks[i]
+            matches.append(
+                {
+                    "requirement": req,
+                    "cv_match": best_block,
+                    "score": round(best_score, 1),
+                }
+            )
+
+        matches.sort(key=lambda x: x["score"], reverse=True)
+        return {
+            "query_stack": query_stack,
+            "candidate_stack": cand_stack,
+            "matches": matches,
+        }
+    except Exception as e:
+        return {"error": str(e)}
     finally:
         session.close()

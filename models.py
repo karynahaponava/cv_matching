@@ -24,7 +24,6 @@ class Candidate(Base):
     cv_text = Column(Text)
     seniority = Column(String)
     direction = Column(String)
-    rate = Column(Numeric(10, 2))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     embedding = Column(LargeBinary, nullable=True)
 

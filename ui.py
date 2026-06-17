@@ -3,6 +3,7 @@ import os
 import re
 import requests
 import streamlit as st
+import time
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
@@ -24,7 +25,7 @@ def _api_post(
 def _extract_keywords(query: str) -> list[str]:
     q = (query or "").lower()
     kws = [k for k in _KW_RE.findall(q) if len(k) >= 2]
-    return list(dict.fromkeys(kws))
+    return list(dict.fromkeys(kws))[:30]
 
 
 def _highlight_stack(stack: str, query: str) -> str:
@@ -70,7 +71,15 @@ def _render_search_results(
             header[0].markdown(f"**{name}**")
             header[1].markdown(f"**{score_label}: {score:.2f}%**")
 
-            st.progress(min(max(score / 100.0, 0.0), 1.0))
+            clamped_score = min(max(score, 0.0), 100.0)
+            st.markdown(
+                f"""
+                <div style="background-color: #e9ecef; border-radius: 4px; height: 8px; width: 100%; margin-bottom: 10px;">
+                    <div style="background-color: #28a745; width: {clamped_score}%; height: 100%; border-radius: 4px;"></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
             if stack:
                 st.markdown(_highlight_stack(stack, query), unsafe_allow_html=True)
@@ -108,6 +117,28 @@ with st.sidebar:
                     data = res.json()
                     if data.get("status") == "success":
                         st.success(f"**{data.get('message')}**")
+                        
+                        status_placeholder = st.empty() 
+                        
+                        while True:
+                            status_res = _api_get("/sync-status")
+                            if status_res.ok:
+                                current_status = status_res.json().get("status", "")
+                                status_placeholder.info(f"**В процессе:** {current_status}")
+                                
+                                current_status_lower = current_status.lower()
+                                if "завершена" in current_status_lower or "прерван" in current_status_lower or "ошибка" in current_status_lower:
+                                    if "завершена" in current_status_lower:
+                                        status_placeholder.success(f"✅ {current_status}")
+                                    else:
+                                        status_placeholder.error(f"❌ {current_status}")
+                                    break 
+                            else:
+                                status_placeholder.warning("Не удалось получить статус с сервера...")
+                                break
+                            
+                            time.sleep(3) 
+                        
                     else:
                         st.error(f"Ошибка бэкенда: {data.get('message')}")
                 else:
@@ -126,71 +157,95 @@ query = st.text_area(
 
 col1, col2 = st.columns(2)
 with col1:
-    target_client = st.text_input(
-        "Конечный клиент", value=""
-    )
+    target_client = st.text_input("Конечный клиент", value="")
 with col2:
-    target_broker = st.text_input(
-        "Брокер / Посредник", value=""
-    )
+    target_broker = st.text_input("Брокер / Посредник", value="")
 
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
 semantic_enabled = st.checkbox(
     "Включить семантический ИИ-поиск (искать по смыслу)", value=True
 )
 
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None
+if "last_query" not in st.session_state:
+    st.session_state.last_query = ""
+if "is_fuzzy" not in st.session_state:
+    st.session_state.is_fuzzy = False
+
 if st.button("Начать поиск", type="primary"):
     q = query.strip()
     if not q:
         st.warning("Пожалуйста, введите требования для поиска.")
+        st.session_state.search_results = None
     else:
-        try:
-            if semantic_enabled:
-                resp = _api_post(
-                    "/semantic-match",
-                    payload={
-                        "query": q,
-                        "target_client": target_client.strip(),
-                        "target_broker": target_broker.strip(),
-                    },
-                )
-                if res.ok:
-                    data = res.json()
-                    if data.get("status") == "success":
-                        st.success(f"**{data.get('message')}**")
-                        st.info("Вы можете продолжать работу с поиском, пока база обновляется в фоновом режиме.")
-                    else:
-                        st.error(f"Ошибка бэкенда: {data.get('message')}")
-
-            elif fuzzy_enabled:
-                keywords = _extract_keywords(q)
-                if not keywords:
-                    st.warning("Не удалось выделить ключевые слова.")
-                else:
+        with st.spinner("Ищу подходящих кандидатов..."):
+            try:
+                if semantic_enabled:
                     resp = _api_post(
-                        "/fuzzy-match",
+                        "/semantic-match",
                         payload={
-                            "keywords": keywords,
+                            "query": q,
                             "target_client": target_client.strip(),
                             "target_broker": target_broker.strip(),
                         },
                     )
                     if resp.ok:
-                        _render_search_results(
-                            resp.json(),
-                            q,
-                            target_client=target_client.strip(),
-                            target_broker=target_broker.strip(),
-                            fuzzy=True,
-                        )
+                        st.session_state.search_results = resp.json()
+                        st.session_state.last_query = q
+                        st.session_state.is_fuzzy = False
                     else:
-                        st.error(f"Ошибка нечёткого поиска: {resp.status_code}")
+                        st.error(f"Ошибка семантического поиска: {resp.status_code}")
+                        st.session_state.search_results = None
 
-            else:
-                resp = _api_get("/search", params={"query": q})
-                if resp.ok:
-                    _render_search_results(resp.json(), q)
+                elif fuzzy_enabled:
+                    keywords = _extract_keywords(q)
+                    if not keywords:
+                        st.warning("Не удалось выделить ключевые слова.")
+                        st.session_state.search_results = None
+                    else:
+                        resp = _api_post(
+                            "/fuzzy-match",
+                            payload={
+                                "keywords": keywords,
+                                "target_client": target_client.strip(),
+                                "target_broker": target_broker.strip(),
+                            },
+                        )
+                        if resp.ok:
+                            st.session_state.search_results = resp.json()
+                            st.session_state.last_query = q
+                            st.session_state.is_fuzzy = True
+                        else:
+                            st.error(f"Ошибка нечёткого поиска: {resp.status_code}")
+                            st.session_state.search_results = None
+
                 else:
-                    st.error(f"Ошибка классического поиска: {resp.status_code}")
-        except Exception as e:
-            st.error(f"Не удалось связаться с сервером API: {e}")
+                    resp = _api_get("/search", params={"query": q})
+                    if resp.ok:
+                        st.session_state.search_results = resp.json()
+                        st.session_state.last_query = q
+                        st.session_state.is_fuzzy = False
+                    else:
+                        st.error(f"Ошибка классического поиска: {resp.status_code}")
+                        st.session_state.search_results = None
+            except Exception as e:
+                st.error(f"Не удалось связаться с сервером API: {e}")
+                st.session_state.search_results = None
+
+if st.session_state.search_results is not None:
+    st.write("---")
+
+    top_results = st.session_state.search_results[:50]
+
+    st.caption(
+        f"Показано: {len(top_results)} из {len(st.session_state.search_results)} найденных."
+    )
+
+    _render_search_results(
+        top_results,
+        st.session_state.last_query,
+        target_client=target_client.strip(),
+        target_broker=target_broker.strip(),
+        fuzzy=st.session_state.is_fuzzy,
+    )
