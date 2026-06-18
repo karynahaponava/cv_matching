@@ -17,7 +17,7 @@ def _api_get(
 
 
 def _api_post(
-    path: str, payload: dict | None = None, timeout_s: int = 1200
+    path: str, payload: dict | None = None, timeout_s: int = 2400
 ) -> requests.Response:
     return requests.post(f"{API_BASE}{path}", json=payload, timeout=timeout_s)
 
@@ -117,28 +117,38 @@ with st.sidebar:
                     data = res.json()
                     if data.get("status") == "success":
                         st.success(f"**{data.get('message')}**")
-                        
-                        status_placeholder = st.empty() 
-                        
+
+                        status_placeholder = st.empty()
+
                         while True:
                             status_res = _api_get("/sync-status")
                             if status_res.ok:
                                 current_status = status_res.json().get("status", "")
-                                status_placeholder.info(f"**В процессе:** {current_status}")
-                                
+                                status_placeholder.info(
+                                    f"**В процессе:** {current_status}"
+                                )
+
                                 current_status_lower = current_status.lower()
-                                if "завершена" in current_status_lower or "прерван" in current_status_lower or "ошибка" in current_status_lower:
+                                if (
+                                    "завершена" in current_status_lower
+                                    or "прерван" in current_status_lower
+                                    or "ошибка" in current_status_lower
+                                ):
                                     if "завершена" in current_status_lower:
-                                        status_placeholder.success(f"✅ {current_status}")
+                                        status_placeholder.success(
+                                            f"✅ {current_status}"
+                                        )
                                     else:
                                         status_placeholder.error(f"❌ {current_status}")
-                                    break 
+                                    break
                             else:
-                                status_placeholder.warning("Не удалось получить статус с сервера...")
+                                status_placeholder.warning(
+                                    "Не удалось получить статус с сервера..."
+                                )
                                 break
-                            
-                            time.sleep(3) 
-                        
+
+                            time.sleep(3)
+
                     else:
                         st.error(f"Ошибка бэкенда: {data.get('message')}")
                 else:
@@ -155,11 +165,21 @@ query = st.text_area(
     height=100,
 )
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
     target_client = st.text_input("Конечный клиент", value="")
 with col2:
     target_broker = st.text_input("Брокер / Посредник", value="")
+with col3:
+    try:
+        dep_res = _api_get("/departments", timeout_s=5)
+        available_departments = dep_res.json() if dep_res.ok else []
+    except:
+        available_departments = []
+
+    selected_depts = st.multiselect(
+        "Отделы (оставьте пустым для поиска по всем):", available_departments
+    )
 
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
 semantic_enabled = st.checkbox(
@@ -188,6 +208,7 @@ if st.button("Начать поиск", type="primary"):
                             "query": q,
                             "target_client": target_client.strip(),
                             "target_broker": target_broker.strip(),
+                            "departments": selected_depts,
                         },
                     )
                     if resp.ok:
@@ -210,6 +231,7 @@ if st.button("Начать поиск", type="primary"):
                                 "keywords": keywords,
                                 "target_client": target_client.strip(),
                                 "target_broker": target_broker.strip(),
+                                "departments": selected_depts,
                             },
                         )
                         if resp.ok:

@@ -34,16 +34,20 @@ class FuzzyMatchRequest(BaseModel):
     threshold: float = 0.1
     target_client: str = ""
     target_broker: str = ""
+    departments: list[str] = []
 
 
 class SemanticMatchRequest(BaseModel):
     query: str
     target_client: str = ""
     target_broker: str = ""
+    departments: list[str] = []
+
 
 class AnalyzeRequest(BaseModel):
     query: str
     cv_url: str
+
 
 def update_status(text: str):
     """Helper function for writing the current status to a file"""
@@ -112,13 +116,13 @@ def internal_parse_cv_stacks(days_limit: int = None):
         updated = 0
         for c in candidates:
             data = extract_all_from_text(c.cv_text)
-            
+
             c.stack = data["stack"] or c.stack
             c.seniority = data["seniority"] or c.seniority
-            
+
             if not c.direction or not c.direction.strip():
                 c.direction = data["direction"]
-                
+
             updated += 1
 
         session.commit()
@@ -279,13 +283,19 @@ def semantic_match(request: SemanticMatchRequest):
     session = SessionLocal()
     try:
         query_vec = embed(request.query)
-        candidates = (
-            session.query(Candidate).filter(Candidate.embedding.is_not(None)).all()
-        )
+
+        db_query = session.query(Candidate).filter(Candidate.embedding.is_not(None))
+
+        if request.departments:
+            db_query = db_query.filter(Candidate.direction.in_(request.departments))
+
+        candidates = db_query.all()
+
         tc, tb = (
             request.target_client.strip().lower(),
             request.target_broker.strip().lower(),
         )
+
         from fuzzy_search import get_candidate_badge
 
         matched_cands = []
@@ -439,5 +449,21 @@ def analyze_cv(request: AnalyzeRequest):
         }
     except Exception as e:
         return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.get("/departments")
+def get_departments():
+    session = SessionLocal()
+    try:
+        deps = (
+            session.query(Candidate.direction)
+            .filter(Candidate.direction.is_not(None), Candidate.direction != "")
+            .distinct()
+            .all()
+        )
+
+        return sorted([d[0] for d in deps])
     finally:
         session.close()

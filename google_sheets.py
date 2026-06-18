@@ -60,6 +60,7 @@ def sync_candidates_from_cloud(session):
 
             req_title = str(row.get("Request", "")).strip()
             req_desc = str(row.get("Request description", "")).strip()
+            department = str(row.get("Department", "")).strip()
 
             raw_date = row.get("Date")
             if pd.isna(raw_date) or not str(raw_date).strip():
@@ -95,7 +96,7 @@ def sync_candidates_from_cloud(session):
                 cand = Candidate(
                     name=name,
                     cv_url=cv_url,
-                    direction=req_title,
+                    direction=department,
                     stack="",
                     seniority="",
                     created_at=submitted_at,
@@ -108,8 +109,8 @@ def sync_candidates_from_cloud(session):
                 if cand.name != name:
                     cand.name = name
                     cand_updated = True
-                if cand.direction != req_title:
-                    cand.direction = req_title
+                if cand.direction != department:
+                    cand.direction = department
                     cand_updated = True
                 if submitted_at and cand.created_at != submitted_at:
                     cand.created_at = submitted_at
