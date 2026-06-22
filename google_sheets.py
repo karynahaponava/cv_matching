@@ -7,6 +7,73 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 
+def sync_vacancies_from_cloud(session, backfill: bool = False):
+    from models import Vacancy
+
+    spreadsheet_url = os.getenv("SPREADSHEET_URL")
+    if not spreadsheet_url:
+        raise Exception("SPREADSHEET_URL не задан в .env файле")
+
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", spreadsheet_url)
+    if not match:
+        raise Exception("Не удалось извлечь ID таблицы из ссылки SPREADSHEET_URL")
+    file_id = match.group(1)
+
+    creds_path = os.getenv("GOOGLE_CREDS_PATH")
+    if not creds_path:
+        raise Exception("GOOGLE_CREDS_PATH не задан в .env файле")
+
+    creds = service_account.Credentials.from_service_account_file(
+        creds_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    raw_data = (
+        service.files()
+        .export(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .execute()
+    )
+
+    df = pd.read_excel(io.BytesIO(raw_data)).fillna("")
+
+    if "Request" not in df.columns:
+        raise Exception("В таблице нет колонки 'Request'.")
+
+    existing = {
+        vac.title: vac for vac in session.query(Vacancy).all()
+    }
+
+    added = 0
+    updated = 0
+    seen = set()
+    for _, row in df.iterrows():
+        title = str(row.get("Request", "")).strip()
+        if not title or title in seen:
+            continue
+        raw_thread = row.get("Thread", "")
+        try:
+            thread_id = int(raw_thread)
+        except (ValueError, TypeError):
+            print(f"[sync_vacancies] Skipping vacancy '{title}': cannot parse Thread value {raw_thread!r} as int")
+            continue
+        seen.add(title)
+        requirements = str(row.get("Request description", "")).strip() or None
+
+        if title not in existing:
+            session.add(Vacancy(title=title, requirements=requirements, thread_id=thread_id))
+            added += 1
+        elif backfill:
+            vac = existing[title]
+            vac.thread_id = thread_id
+            vac.requirements = requirements
+            updated += 1
+
+    session.commit()
+    return {"added": added, "updated": updated, "skipped": len(seen) - added - updated}
+
+
 def sync_candidates_from_cloud(session):
     try:
         spreadsheet_url = os.getenv("SPREADSHEET_URL")

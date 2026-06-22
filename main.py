@@ -18,7 +18,7 @@ from sqlalchemy import func, or_
 from db import Base, SessionLocal, engine
 from models import Candidate, Submission, Vacancy
 from google_docs import get_doc_text
-from google_sheets import sync_candidates_from_cloud
+from google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
 from cv_parser import extract_all_from_text
 from fuzzy_search import fuzzy_search_candidates
 from matcher import calculate_match_score
@@ -449,6 +449,50 @@ def analyze_cv(request: AnalyzeRequest):
         }
     except Exception as e:
         return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.post("/sync-vacancies")
+def sync_vacancies(backfill: bool = Query(False)):
+    session = SessionLocal()
+    try:
+        stats = sync_vacancies_from_cloud(session, backfill=backfill)
+        return {"status": "success", "stats": stats}
+    except Exception as e:
+        session.rollback()
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@app.get("/vacancies")
+def get_vacancies(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100)):
+    session = SessionLocal()
+    try:
+        total = session.query(func.count(Vacancy.id)).scalar()
+        rows = (
+            session.query(Vacancy)
+            .order_by(Vacancy.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [
+                {
+                    "id": v.id,
+                    "thread_id": v.thread_id,
+                    "title": v.title,
+                    "requirements": v.requirements,
+                    "created_at": v.created_at.isoformat() if v.created_at else None,
+                }
+                for v in rows
+            ],
+        }
     finally:
         session.close()
 
