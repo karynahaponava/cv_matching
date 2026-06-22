@@ -17,12 +17,12 @@ from sqlalchemy import func, or_
 
 from db import Base, SessionLocal, engine
 from models import Candidate, Submission, Vacancy
-from google_docs import get_doc_text
-from google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
-from cv_parser import extract_all_from_text
-from fuzzy_search import fuzzy_search_candidates
-from matcher import calculate_match_score
-from embeddings import embed, cosine_similarity
+from services.google_docs import get_doc_text
+from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
+from services.cv_parser import extract_all_from_text
+from services.fuzzy_search import fuzzy_search_candidates
+from services.matcher import calculate_match_score
+from services.embeddings import embed, cosine_similarity
 
 
 class ImportExcelRequest(BaseModel):
@@ -296,7 +296,7 @@ def semantic_match(request: SemanticMatchRequest):
             request.target_broker.strip().lower(),
         )
 
-        from fuzzy_search import get_candidate_badge
+        from services.fuzzy_search import get_candidate_badge
 
         matched_cands = []
         for c in candidates:
@@ -385,7 +385,7 @@ def get_sync_status():
 
 @app.post("/analyze-cv")
 def analyze_cv(request: AnalyzeRequest):
-    from embeddings import model, cosine_similarity, embed
+    from services.embeddings import model, cosine_similarity, embed
 
     session = SessionLocal()
     try:
