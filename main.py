@@ -467,17 +467,18 @@ def sync_vacancies(backfill: bool = Query(False)):
 
 
 @app.get("/vacancies")
-def get_vacancies(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100)):
+def get_vacancies(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    department: str = Query(None),
+):
     session = SessionLocal()
     try:
-        total = session.query(func.count(Vacancy.id)).scalar()
-        rows = (
-            session.query(Vacancy)
-            .order_by(Vacancy.created_at.desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
-            .all()
-        )
+        query = session.query(Vacancy)
+        if department:
+            query = query.filter(Vacancy.department == department)
+        total = query.with_entities(func.count(Vacancy.id)).scalar()
+        rows = query.order_by(Vacancy.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
         return {
             "total": total,
             "page": page,
@@ -487,12 +488,23 @@ def get_vacancies(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, l
                     "id": v.id,
                     "thread_id": v.thread_id,
                     "title": v.title,
+                    "department": v.department,
                     "requirements": v.requirements,
                     "created_at": v.created_at.isoformat() if v.created_at else None,
                 }
                 for v in rows
             ],
         }
+    finally:
+        session.close()
+
+
+@app.get("/vacancy-departments")
+def get_vacancy_departments():
+    session = SessionLocal()
+    try:
+        rows = session.query(Vacancy.department).filter(Vacancy.department != "N/A").distinct().all()
+        return sorted([r[0] for r in rows])
     finally:
         session.close()
 

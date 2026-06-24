@@ -42,14 +42,33 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Ошибка подключения к API: {e}")
 
+    st.divider()
+    st.header("Фильтры")
+
+    try:
+        dept_res = _api_get("/vacancy-departments")
+        departments = dept_res.json() if dept_res.ok else []
+    except Exception:
+        departments = []
+
+    dept_options = ["Все"] + departments
+    selected_dept = st.selectbox("Направление", dept_options)
+    if selected_dept != st.session_state.get("vac_dept_filter"):
+        st.session_state.vac_dept_filter = selected_dept
+        st.session_state.vac_page = 1
+
 st.title("Список запросов")
 st.markdown("Все вакансии / запросы, загруженные в систему.")
 
 if "vac_page" not in st.session_state:
     st.session_state.vac_page = 1
 
+params = {"page": st.session_state.vac_page, "page_size": PAGE_SIZE}
+if st.session_state.get("vac_dept_filter") and st.session_state.vac_dept_filter != "Все":
+    params["department"] = st.session_state.vac_dept_filter
+
 try:
-    res = _api_get("/vacancies", params={"page": st.session_state.vac_page, "page_size": PAGE_SIZE})
+    res = _api_get("/vacancies", params=params)
     if not res.ok:
         st.error(f"Ошибка сервера: {res.status_code}")
         st.stop()
@@ -60,7 +79,7 @@ except Exception as e:
 
 total: int = data["total"]
 items: list = data["items"]
-total_pages = max(1, -(-total // PAGE_SIZE))  # ceiling division
+total_pages = max(1, -(-total // PAGE_SIZE))
 
 st.caption(f"Всего запросов: **{total}** | Страница {st.session_state.vac_page} из {total_pages}")
 
@@ -69,8 +88,9 @@ if not items:
 else:
     for vac in items:
         with st.container(border=True):
-            col_title, col_date = st.columns([5, 2])
+            col_title, col_dept, col_date = st.columns([4, 2, 2])
             col_title.markdown(f"**{vac['thread_id']}  {vac['title']}**")
+            col_dept.caption(vac.get("department") or "")
             created = vac.get("created_at", "")
             if created:
                 try:
