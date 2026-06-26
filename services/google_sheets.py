@@ -59,14 +59,16 @@ def sync_vacancies_from_cloud(session, backfill: bool = False):
             print(f"[sync_vacancies] Skipping vacancy '{title}': cannot parse Thread value {raw_thread!r} as int")
             continue
         seen.add(title)
-        requirements = str(row.get("Request description", "")).strip() or None
+        requirements = str(row.get("Request description", "")).strip() or "N/A"
+        department = str(row.get("Department", "")).strip() or "N/A"
 
         if title not in existing:
-            session.add(Vacancy(title=title, requirements=requirements, thread_id=thread_id))
+            session.add(Vacancy(title=title, requirements=requirements, thread_id=thread_id, department=department))
             added += 1
         elif backfill:
             vac = existing[title]
             vac.thread_id = thread_id
+            vac.department = department
             vac.requirements = requirements
             updated += 1
 
