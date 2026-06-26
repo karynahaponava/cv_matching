@@ -34,6 +34,8 @@ class Vacancy(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String, nullable=False)
     requirements = Column(Text)
+    thread_id = Column(Integer, nullable=False)
+    department = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 

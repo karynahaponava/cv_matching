@@ -17,12 +17,12 @@ from sqlalchemy import func, or_
 
 from db import Base, SessionLocal, engine
 from models import Candidate, Submission, Vacancy
-from google_docs import get_doc_text
-from google_sheets import sync_candidates_from_cloud
-from cv_parser import extract_all_from_text
-from fuzzy_search import fuzzy_search_candidates
-from matcher import calculate_match_score
-from embeddings import embed, cosine_similarity
+from services.google_docs import get_doc_text
+from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
+from services.cv_parser import extract_all_from_text
+from services.fuzzy_search import fuzzy_search_candidates
+from services.matcher import calculate_match_score
+from services.embeddings import embed, cosine_similarity
 
 
 class ImportExcelRequest(BaseModel):
@@ -296,7 +296,7 @@ def semantic_match(request: SemanticMatchRequest):
             request.target_broker.strip().lower(),
         )
 
-        from fuzzy_search import get_candidate_badge
+        from services.fuzzy_search import get_candidate_badge
 
         matched_cands = []
         for c in candidates:
@@ -385,7 +385,7 @@ def get_sync_status():
 
 @app.post("/analyze-cv")
 def analyze_cv(request: AnalyzeRequest):
-    from embeddings import model, cosine_similarity, embed
+    from services.embeddings import model, cosine_similarity, embed
 
     session = SessionLocal()
     try:
@@ -449,6 +449,62 @@ def analyze_cv(request: AnalyzeRequest):
         }
     except Exception as e:
         return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.post("/sync-vacancies")
+def sync_vacancies(backfill: bool = Query(False)):
+    session = SessionLocal()
+    try:
+        stats = sync_vacancies_from_cloud(session, backfill=backfill)
+        return {"status": "success", "stats": stats}
+    except Exception as e:
+        session.rollback()
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@app.get("/vacancies")
+def get_vacancies(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    department: str = Query(None),
+):
+    session = SessionLocal()
+    try:
+        query = session.query(Vacancy)
+        if department:
+            query = query.filter(Vacancy.department == department)
+        total = query.with_entities(func.count(Vacancy.id)).scalar()
+        rows = query.order_by(Vacancy.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [
+                {
+                    "id": v.id,
+                    "thread_id": v.thread_id,
+                    "title": v.title,
+                    "department": v.department,
+                    "requirements": v.requirements,
+                    "created_at": v.created_at.isoformat() if v.created_at else None,
+                }
+                for v in rows
+            ],
+        }
+    finally:
+        session.close()
+
+
+@app.get("/vacancy-departments")
+def get_vacancy_departments():
+    session = SessionLocal()
+    try:
+        rows = session.query(Vacancy.department).filter(Vacancy.department != "N/A").distinct().all()
+        return sorted([r[0] for r in rows])
     finally:
         session.close()
 
