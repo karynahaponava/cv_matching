@@ -8,7 +8,7 @@ from googleapiclient.discovery import build
 
 
 def sync_vacancies_from_cloud(session, backfill: bool = False):
-    from models import Vacancy
+    from database.models import Vacancy
 
     spreadsheet_url = os.getenv("SPREADSHEET_URL")
     if not spreadsheet_url:
@@ -111,7 +111,7 @@ def sync_candidates_from_cloud(session):
         if "Candidate" not in df.columns or "Link" not in df.columns:
             raise Exception("На вкладке нет колонок 'Candidate' или 'Link'.")
 
-        from models import Candidate, Submission, Vacancy
+        from database.models import Candidate, Submission, Vacancy
 
         added_cand_count = 0
         updated_cand_count = 0

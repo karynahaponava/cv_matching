@@ -15,8 +15,8 @@ from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func, or_
 
-from db import Base, SessionLocal, engine
-from models import Candidate, Submission, Vacancy
+from database.db import Base, SessionLocal, engine
+from database.models import Candidate, Submission, Vacancy
 from services.google_docs import get_doc_text
 from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
 from services.cv_parser import extract_all_from_text
