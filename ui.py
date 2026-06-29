@@ -192,6 +192,8 @@ if "last_query" not in st.session_state:
     st.session_state.last_query = ""
 if "is_fuzzy" not in st.session_state:
     st.session_state.is_fuzzy = False
+if "display_limit" not in st.session_state:
+    st.session_state.display_limit = 50
 
 if st.button("Начать поиск", type="primary"):
     q = query.strip()
@@ -199,6 +201,7 @@ if st.button("Начать поиск", type="primary"):
         st.warning("Пожалуйста, введите требования для поиска.")
         st.session_state.search_results = None
     else:
+        st.session_state.display_limit = 50
         with st.spinner("Ищу подходящих кандидатов..."):
             try:
                 if semantic_enabled:
@@ -257,8 +260,8 @@ if st.button("Начать поиск", type="primary"):
 
 if st.session_state.search_results is not None:
     st.write("---")
-
-    top_results = st.session_state.search_results[:50]
+    limit = st.session_state.display_limit
+    top_results = st.session_state.search_results[:limit]
 
     st.caption(
         f"Показано: {len(top_results)} из {len(st.session_state.search_results)} найденных."
@@ -271,3 +274,8 @@ if st.session_state.search_results is not None:
         target_broker=target_broker.strip(),
         fuzzy=st.session_state.is_fuzzy,
     )
+
+    if limit < len(st.session_state.search_results):
+        if st.button("Показать еще 50"):
+            st.session_state.display_limit += 50
+            st.rerun() 
