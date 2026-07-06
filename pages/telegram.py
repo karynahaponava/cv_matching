@@ -12,7 +12,7 @@ default_channels = list(dict.fromkeys([ch.strip() for ch in tg_channels_raw.spli
 
 st.set_page_config(page_title="Парсер ТГК", layout="wide")
 
-st.title("Парсер Telegram-каналов 🚀")
+st.title("Парсер Telegram-каналов")
 st.markdown("Сбор вакансий из публичных ТГ-каналов для последующего ИИ-анализа и добавления в базу.")
 
 if "tg_posts" not in st.session_state:
@@ -20,7 +20,7 @@ if "tg_posts" not in st.session_state:
 
 with st.container(border=True):
     st.subheader("Настройки парсинга")
-    
+
     col1, col2 = st.columns([3, 1])
     
     with col1:
@@ -52,7 +52,6 @@ with st.container(border=True):
                     if res.ok:
                         data = res.json()
                         if data.get("status") == "success":
-                            # Сохраняем посты в сессию!
                             st.session_state.tg_posts = data.get('posts', [])
                         else:
                             st.error(f"Ошибка парсера: {data.get('detail')}")
@@ -68,20 +67,25 @@ if st.session_state.tg_posts:
         with st.expander(f"Пост #{idx + 1} из @{post.get('channel', 'канала')}"):
             st.text_area("Текст оригинала", post['text'], height=200, disabled=True, key=f"text_{idx}")
             
-            if st.button("💾 Сохранить пост в Базу", key=f"save_{idx}"):
-                with st.spinner("Сохраняем..."):
-                    try:
-                        save_res = requests.post(
-                            f"{API_BASE}/save-tg-vacancy",
-                            json={"channel": post['channel'], "text": post['text']}
-                        )
-                        if save_res.ok:
-                            data_save = save_res.json()
-                            if data_save.get("status") == "success":
+            col_btn1, col_btn2 = st.columns(2)
+            
+            with col_btn1:
+                if st.button("Сохранить в БД", key=f"save_{idx}", use_container_width=True):
+                    with st.spinner("Сохраняем..."):
+                        try:
+                            save_res = requests.post(
+                                f"{API_BASE}/save-tg-vacancy",
+                                json={"channel": post['channel'], "text": post['text']}
+                            )
+                            if save_res.ok and save_res.json().get("status") == "success":
                                 st.success("Успешно сохранено в БД!")
                             else:
-                                st.info(data_save.get("message", "Этот пост уже есть в базе"))
-                        else:
-                            st.error("Ошибка сервера при сохранении")
-                    except Exception as e:
-                        st.error(f"Ошибка: {e}")
+                                st.info("Этот пост уже есть в базе или произошла ошибка.")
+                        except Exception as e:
+                            st.error(f"Ошибка: {e}")
+                            
+            with col_btn2:
+                if st.button("Подобрать кандидатов", key=f"match_{idx}", use_container_width=True):
+                    st.session_state["search_query_input"] = post['text']
+                    
+                    st.switch_page("ui.py")
