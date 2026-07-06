@@ -4,7 +4,7 @@ from bs4 import BeautifulSoup
 
 def fetch_tg_channel_posts(channel_url: str, limit: int = 10) -> list[dict]:
     """
-    Парсит публичные Telegram-каналы через их веб-превью.
+    Парсит публичные Telegram-каналы через их веб-превью, вытаскивая текст и ID поста.
     """
     match = re.search(r"(?:t\.me/(?:s/)?|@)([a-zA-Z0-9_]+)", channel_url)
     if not match:
@@ -20,18 +20,33 @@ def fetch_tg_channel_posts(channel_url: str, limit: int = 10) -> list[dict]:
         raise Exception(f"Ошибка доступа к каналу. Код: {response.status_code}")
 
     soup = BeautifulSoup(response.text, "html.parser")
-    message_divs = soup.find_all("div", class_="tgme_widget_message_text")
+    
+    messages = soup.find_all("div", class_="tgme_widget_message")
     
     results = []
-    for div in reversed(message_divs[-limit:]):
-        for br in div.find_all("br"):
+    for msg in reversed(messages[-limit:]):
+        text_div = msg.find("div", class_="tgme_widget_message_text")
+        if not text_div:
+            continue
+            
+        data_post = msg.get("data-post", "")
+        post_id = 0
+        if "/" in data_post:
+            try:
+                post_id = int(data_post.split("/")[-1])
+            except ValueError:
+                pass
+
+        for br in text_div.find_all("br"):
             br.replace_with("\n")
             
-        text = div.get_text(strip=True)
+        text = text_div.get_text(strip=True)
+        
         if len(text) > 100:
             results.append({
                 "channel": channel_name,
-                "text": text
+                "text": text,
+                "post_id": post_id
             })
             
     return results

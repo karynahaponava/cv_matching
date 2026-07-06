@@ -16,7 +16,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func, or_
 
 from db import Base, SessionLocal, engine
-from models import Candidate, Submission, Vacancy, TelegramVacancy
+from models import Candidate, Submission, Vacancy, TelegramVacancy, TelegramChannelState
 from services.google_docs import get_doc_text
 from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
 from services.cv_parser import extract_all_from_text
@@ -24,7 +24,6 @@ from services.fuzzy_search import fuzzy_search_candidates
 from services.matcher import calculate_match_score
 from services.embeddings import embed, cosine_similarity
 from services.tg_scraper import fetch_tg_channel_posts
-
 
 class TGSaveRequest(BaseModel):
     channel: str
@@ -208,6 +207,79 @@ def nightly_maintenance_job():
     process_cvs_in_background(days_limit=2)
     print("\n" + "=" * 50 + "\n")
 
+def scheduled_tg_parsing_job():
+    """Автоматический парсинг Telegram-каналов с использованием ватермарок (курсоров)"""
+    print("\n" + "=" * 50)
+    print(f"Старт автоматического парсинга ТГК с ватермарками: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 50)
+    
+    tg_channels_raw = os.getenv("TG_CHANNELS", "")
+    channels = list(dict.fromkeys([ch.strip() for ch in tg_channels_raw.split(",") if ch.strip()]))
+    
+    if not channels:
+        print("[Расписание ТГ] Список каналов в TG_CHANNELS пуст. Парсинг отменен.")
+        return
+
+    session = SessionLocal()
+    saved_count = 0
+
+    try:
+        for channel_url in channels:
+            channel_name = channel_url.strip("/").split("/")[-1]
+            print(f"[Расписание ТГ] Проверяем канал: @{channel_name}...")
+            
+            state = session.query(TelegramChannelState).filter_by(channel=channel_name).first()
+            if not state:
+                state = TelegramChannelState(channel=channel_name, last_post_id=0)
+                session.add(state)
+                session.flush() 
+
+            last_saved_id = state.last_post_id
+            
+            try:
+                posts = fetch_tg_channel_posts(channel_url, limit=20)
+                
+                new_posts = [p for p in posts if p.get('post_id', 0) > last_saved_id]
+                new_posts.sort(key=lambda x: x.get('post_id', 0))
+                
+                if not new_posts:
+                    print(f"  -> Нет новых постов. (Ватермарка на отметке ID: {last_saved_id})")
+                    continue
+                    
+                for post in new_posts:
+                    current_post_id = post.get('post_id', 0)
+                    
+                    exists_text = session.query(TelegramVacancy).filter_by(
+                        channel=post['channel'], 
+                        raw_text=post['text']
+                    ).first()
+                    
+                    if exists_text:
+                        state.last_post_id = current_post_id
+                        continue
+                        
+                    new_vac = TelegramVacancy(
+                        channel=post['channel'], 
+                        raw_text=post['text']
+                    )
+                    session.add(new_vac)
+                    saved_count += 1
+                    
+                    state.last_post_id = current_post_id
+                    
+                print(f"  -> Успешно обработано и сохранено новых постов: {len(new_posts)}")
+                
+            except Exception as e:
+                print(f"[Расписание ТГ] Ошибка при обработке канала @{channel_name}: {e}")
+                
+        session.commit()
+        print(f"[Расписание ТГ] Скрипт отработал. Всего добавлено записей за этот цикл: {saved_count}")
+    except Exception as e:
+        session.rollback()
+        print(f"[Расписание ТГ] Глобальная ошибка планировщика: {e}")
+    finally:
+        session.close()
+    print("=" * 50 + "\n")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -216,6 +288,11 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         nightly_maintenance_job, "cron", hour=1, minute=0, misfire_grace_time=3600
     )
+
+    scheduler.add_job(
+        scheduled_tg_parsing_job, "interval", hours=4, minute=0, misfire_grace_time=600
+    )
+
     scheduler.start()
     print("⏰ Планировщик запущен! Единая ночная сборка назначена на 01:00.")
     print("   Правило: Вся таблица Excel ➡️ Дельта за 2 дня (Тексты, Стек, ИИ-векторы)")

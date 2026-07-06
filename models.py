@@ -1,5 +1,4 @@
 from datetime import datetime
-
 from sqlalchemy import (
     Column,
     DateTime,
@@ -51,8 +50,6 @@ class Submission(Base):
     request_result = Column(String)
     submitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-from sqlalchemy import Text
-
 class TelegramVacancy(Base):
     __tablename__ = "telegram_vacancies"
 
@@ -60,3 +57,10 @@ class TelegramVacancy(Base):
     channel = Column(String, index=True)
     raw_text = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class TelegramChannelState(Base):
+    __tablename__ = "telegram_channel_states"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    channel = Column(String, unique=True, index=True, nullable=False)
+    last_post_id = Column(Integer, default=0, nullable=False)
