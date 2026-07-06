@@ -16,3 +16,4 @@ numpy
 sentence-transformers
 python-docx
 PyPDF2 
+beautifulsoup4==4.12.3

@@ -16,13 +16,19 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func, or_
 
 from db import Base, SessionLocal, engine
-from models import Candidate, Submission, Vacancy
+from models import Candidate, Submission, Vacancy, TelegramVacancy
 from services.google_docs import get_doc_text
 from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
 from services.cv_parser import extract_all_from_text
 from services.fuzzy_search import fuzzy_search_candidates
 from services.matcher import calculate_match_score
 from services.embeddings import embed, cosine_similarity
+from services.tg_scraper import fetch_tg_channel_posts
+
+
+class TGSaveRequest(BaseModel):
+    channel: str
+    text: str
 
 
 class ImportExcelRequest(BaseModel):
@@ -48,6 +54,9 @@ class AnalyzeRequest(BaseModel):
     query: str
     cv_url: str
 
+class TGRequest(BaseModel):
+    url: str
+    limit: int = 10
 
 def update_status(text: str):
     """Helper function for writing the current status to a file"""
@@ -521,5 +530,39 @@ def get_departments():
         )
 
         return sorted([d[0] for d in deps])
+    finally:
+        session.close()
+
+@app.post("/parse-tg")
+def parse_tg_endpoint(req: TGRequest):
+    try:
+        posts = fetch_tg_channel_posts(req.url, req.limit)
+        return {"status": "success", "posts": posts}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.post("/save-tg-vacancy")
+def save_tg_vacancy(req: TGSaveRequest):
+    session = SessionLocal()
+    try:
+        # Проверяем, нет ли уже такого поста в базе (защита от дублей)
+        exists = session.query(TelegramVacancy).filter_by(
+            channel=req.channel, 
+            raw_text=req.text
+        ).first()
+        
+        if exists:
+            return {"status": "ignored", "message": "Этот пост уже есть в базе"}
+
+        new_vac = TelegramVacancy(
+            channel=req.channel, 
+            raw_text=req.text
+        )
+        session.add(new_vac)
+        session.commit()
+        return {"status": "success"}
+    except Exception as e:
+        session.rollback()
+        return {"status": "error", "detail": str(e)}
     finally:
         session.close()

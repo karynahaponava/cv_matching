@@ -50,3 +50,13 @@ class Submission(Base):
     status = Column(String)
     request_result = Column(String)
     submitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+from sqlalchemy import Text
+
+class TelegramVacancy(Base):
+    __tablename__ = "telegram_vacancies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    channel = Column(String, index=True)
+    raw_text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
