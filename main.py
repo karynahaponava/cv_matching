@@ -290,7 +290,7 @@ async def lifespan(app: FastAPI):
     )
 
     scheduler.add_job(
-        scheduled_tg_parsing_job, "interval", hours=4, minute=0, misfire_grace_time=600
+        scheduled_tg_parsing_job, "interval", hours=4, minutes=0, misfire_grace_time=600
     )
 
     scheduler.start()
