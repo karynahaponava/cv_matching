@@ -290,7 +290,7 @@ async def lifespan(app: FastAPI):
     )
 
     scheduler.add_job(
-        scheduled_tg_parsing_job, "interval", hours=4, minutes=0, misfire_grace_time=600
+        scheduled_tg_parsing_job, "interval", hours=4, misfire_grace_time=600
     )
 
     scheduler.start()
@@ -622,7 +622,6 @@ def parse_tg_endpoint(req: TGRequest):
 def save_tg_vacancy(req: TGSaveRequest):
     session = SessionLocal()
     try:
-        # Проверяем, нет ли уже такого поста в базе (защита от дублей)
         exists = session.query(TelegramVacancy).filter_by(
             channel=req.channel, 
             raw_text=req.text
@@ -641,5 +640,31 @@ def save_tg_vacancy(req: TGSaveRequest):
     except Exception as e:
         session.rollback()
         return {"status": "error", "detail": str(e)}
+    finally:
+        session.close()
+
+@app.get("/saved-tg-vacancies")
+def get_saved_tg_vacancies(
+    page: int = Query(1, ge=1), 
+    page_size: int = Query(20, ge=1, le=100)
+):
+    session = SessionLocal()
+    try:
+        total = session.query(TelegramVacancy).count()
+        rows = (
+            session.query(TelegramVacancy)
+            .order_by(TelegramVacancy.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [{"id": v.id, "channel": v.channel, "text": v.raw_text} for v in rows]
+        }
+    except Exception as e:
+        return {"error": str(e)}
     finally:
         session.close()
