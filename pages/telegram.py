@@ -51,7 +51,11 @@ with st.container(border=True):
                     if res.ok:
                         data = res.json()
                         if data.get("status") == "success":
-                            st.session_state.tg_posts = data.get('posts', [])
+                            posts = data.get('posts', [])
+                            st.session_state.tg_posts = posts
+                            
+                            if not posts:
+                                st.warning("Парсер отработал, но вернул 0 постов. Возможно, Телеграм временно ограничил доступ (429) или посты слишком короткие.")
                         else:
                             st.error(f"Ошибка парсера: {data.get('detail')}")
                     else:

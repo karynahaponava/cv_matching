@@ -58,10 +58,7 @@ def fetch_tg_channel_posts(channel_url: str, limit: int = 10) -> list[dict]:
                     "text": text,
                     "post_id": int(data_post.split("/")[-1]) if "/" in data_post else 0
                 })
-        
-        if not page_posts:
-            break
-            
+
         results = page_posts + results
         
         if min_post_id == float('inf') or min_post_id <= 1 or next_before == min_post_id:
