@@ -157,8 +157,10 @@ def fuzzy_search_candidates(
             SELECT
                 c.id, c.name, c.cv_url, c.stack,
                 GREATEST(
-                    CASE WHEN c.stack ILIKE '%' || kw.keyword || '%' THEN 1.0 ELSE 0.0 END,
-                    CASE WHEN c.cv_text ILIKE '%' || kw.keyword || '%' THEN 1.0 ELSE 0.0 END,
+                    -- Проверка на точное совпадение целого слова (без эффекта Django)
+                    CASE WHEN c.stack ~* ('\m' || kw.keyword || '\M') THEN 1.0 ELSE 0.0 END,
+                    CASE WHEN c.cv_text ~* ('\m' || kw.keyword || '\M') THEN 1.0 ELSE 0.0 END,
+                    -- Нечеткий поиск (прощает опечатки)
                     word_similarity(kw.keyword, lower(COALESCE(c.stack, ''))),
                     word_similarity(kw.keyword, lower(COALESCE(c.cv_text, '')))
                 ) AS sim
@@ -168,15 +170,16 @@ def fuzzy_search_candidates(
         aggregated AS (
             SELECT
                 id, name, cv_url, stack,
-                MAX(sim) AS max_sim
+                -- Берем СРЕДНЕЕ совпадение по всем введенным словам, а не максимум
+                AVG(sim) AS final_sim
             FROM per_keyword
             GROUP BY id, name, cv_url, stack
         )
         SELECT
             a.id, a.name, a.cv_url, a.stack,
-            ROUND((a.max_sim * 100)::numeric, 2) AS score
+            ROUND((a.final_sim * 100)::numeric, 2) AS score
         FROM aggregated a
-        WHERE a.max_sim >= :threshold
+        WHERE a.final_sim >= :threshold
         ORDER BY score DESC
         """)
 

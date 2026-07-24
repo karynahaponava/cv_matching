@@ -282,7 +282,14 @@ def fuzzy_match(request: FuzzyMatchRequest):
 def semantic_match(request: SemanticMatchRequest):
     session = SessionLocal()
     try:
-        query_vec = embed(request.query)
+        ai_query = request.query
+        
+        ai_query = re.sub(r'(?i)\bgo\b', 'golang', ai_query)
+        
+        if len(request.query.split()) <= 2:
+            ai_query += " разработчик IT"
+
+        query_vec = embed(ai_query)
 
         db_query = session.query(Candidate).filter(Candidate.embedding.is_not(None))
 

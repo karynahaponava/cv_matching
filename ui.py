@@ -7,8 +7,7 @@ import time
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
-_KW_RE = re.compile(r"[a-zA-Zа-яА-Я0-9][a-zA-Zа-яА-Я0-9+#\.\-_/]*")
-
+_KW_RE = re.compile(r"[a-zA-Zа-яА-Я0-9\.+#][a-zA-Zа-яА-Я0-9+#\.\-_/]*")
 
 def _api_get(
     path: str, params: dict | None = None, timeout_s: int = 20
