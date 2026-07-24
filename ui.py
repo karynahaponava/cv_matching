@@ -101,8 +101,38 @@ def _render_search_results(
             if cv_url:
                 st.caption(f"Постоянная ссылка: {cv_url}")
 
+def _reset_search_results():
+    st.session_state.search_results = None
+
 
 st.set_page_config(page_title="CV Matching UI", layout="wide")
+
+st.markdown("""
+    <style>
+        header[data-testid="stHeader"] {
+            position: static !important;
+        }
+
+        [data-testid="stHorizontalBlock"] {
+            display: flex !important;
+            flex-direction: row !important; 
+            flex-wrap: nowrap !important;
+            gap: 0.75rem !important;
+        }
+
+        [data-testid="stColumn"] {
+            width: 33.33% !important;
+            min-width: 0 !important; 
+            flex: 1 1 0 !important;
+        }
+
+        [data-testid="stColumn"] > div,
+        [data-testid="stColumn"] input,
+        [data-baseweb="select"] {
+            min-width: 0 !important;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Синхронизация данных")
@@ -163,22 +193,34 @@ query = st.text_area(
     height=100,
 )
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    target_client = st.text_input("Конечный клиент", value="")
-with col2:
-    target_broker = st.text_input("Брокер / Посредник", value="")
-with col3:
-    try:
-        dep_res = _api_get("/departments", timeout_s=5)
-        available_departments = dep_res.json() if dep_res.ok else []
-    except:
-        available_departments = []
+try:
+    dep_res = _api_get("/departments", timeout_s=5)
+    available_departments = dep_res.json() if dep_res.ok else []
+except Exception:
+    available_departments = []
 
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    target_client = st.text_input(
+        "Конечный клиент", 
+        value="", 
+        on_change=_reset_search_results
+    )
+
+with col2:
+    target_broker = st.text_input(
+        "Брокер / Посредник", 
+        value="", 
+        on_change=_reset_search_results
+    )
+
+with col3:
     selected_depts = st.multiselect(
-        "Отделы (оставьте пустым для поиска по всем):", 
+        "Отделы", 
         available_departments,
-        placeholder="Выберите отдел"
+        placeholder="Все отделы (или выберите)",
+        on_change=_reset_search_results
     )
 
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
