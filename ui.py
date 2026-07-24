@@ -107,7 +107,6 @@ st.set_page_config(page_title="CV Matching UI", layout="wide")
 
 with st.sidebar:
     st.header("Синхронизация данных")
-    st.caption(f"Бэкенд: `{API_BASE}`")
 
     if st.button("Синхронизация", use_container_width=True, type="primary"):
         with st.spinner("Отправка команды на сервер..."):
@@ -178,7 +177,9 @@ with col3:
         available_departments = []
 
     selected_depts = st.multiselect(
-        "Отделы (оставьте пустым для поиска по всем):", available_departments
+        "Отделы (оставьте пустым для поиска по всем):", 
+        available_departments,
+        placeholder="Выберите отдел"
     )
 
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
