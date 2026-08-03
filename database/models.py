@@ -1,4 +1,5 @@
 from datetime import datetime
+import pandas as pd
 
 from sqlalchemy import (
     Column,
@@ -11,6 +12,7 @@ from sqlalchemy import (
     LargeBinary,
 )
 
+from sqlalchemy.orm import validates
 from database.db import Base
 
 
@@ -26,6 +28,12 @@ class Candidate(Base):
     direction = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     embedding = Column(LargeBinary, nullable=True)
+
+    @validates('created_at')
+    def validate_created_at(self, key, value):
+        if value is None or pd.isna(value) or str(value).strip() in ["", "NaT"]:
+            return datetime.utcnow()
+        return value
 
 
 class Vacancy(Base):
@@ -50,3 +58,9 @@ class Submission(Base):
     status = Column(String)
     request_result = Column(String)
     submitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    @validates('submitted_at')
+    def validate_submitted_at(self, key, value):
+        if value is None or pd.isna(value) or str(value).strip() in ["", "NaT"]:
+            return datetime.utcnow()
+        return value
