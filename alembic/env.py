@@ -14,8 +14,8 @@ if config.config_file_name is not None:
 
 config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
 
-from db import Base
-import models  # noqa: F401 — ensures all models are registered on Base.metadata
+from database.db import Base
+import database.models as models  # noqa: F401 — ensures all models are registered on Base.metadata
 
 target_metadata = Base.metadata
 

@@ -11,7 +11,7 @@ from sqlalchemy import (
     LargeBinary,
 )
 
-from db import Base
+from database.db import Base
 
 
 class Candidate(Base):
