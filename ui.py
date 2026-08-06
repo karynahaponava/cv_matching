@@ -187,17 +187,29 @@ with st.sidebar:
 st.title("CV Matching System")
 
 st.subheader("Поиск кандидатов по требованиям")
+
 query = st.text_area(
     "Введите стек или требования для поиска",
+    value=st.session_state.get("saved_query", ""),
     placeholder="Например: python fastapi postgresql docker",
     height=100,
+    key="search_query_input"
 )
 
-try:
-    dep_res = _api_get("/departments", timeout_s=5)
-    available_departments = dep_res.json() if dep_res.ok else []
-except Exception:
-    available_departments = []
+if "auto_search_query" in st.session_state:
+    del st.session_state["auto_search_query"]
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    target_client = st.text_input("Конечный клиент", value="")
+with col2:
+    target_broker = st.text_input("Брокер / Посредник", value="")
+with col3:
+    try:
+        dep_res = _api_get("/departments", timeout_s=5)
+        available_departments = dep_res.json() if dep_res.ok else []
+    except:
+        available_departments = []
 
 col1, col2, col3 = st.columns(3)
 

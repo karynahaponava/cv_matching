@@ -68,6 +68,30 @@ docker-compose up --build
 - Creates/updates Submission records (client, broker, status, request_result)
 - Upserts Vacancy records from request titles
 
+##### Google Spreadsheet Columns
+| Column | Description |
+|--------|-------------|
+| Date | Submission date |
+| Request | Vacancy title |
+| Broker | Intermediary/broker name |
+| Client | End client name |
+| Sales | Sales person |
+| Thread | Unique vacancy identifier (used as vacancy id for deduplication) |
+| Request description | Vacancy requirements text |
+| Link | Candidate CV URL |
+| Additional info | Extra notes |
+| Candidate | Candidate full name |
+| Status | Submission status |
+| Request result | Outcome of the request |
+| Save failed | Flag for failed saves |
+| Registration | Registration info |
+| Department | Candidate department/direction |
+| CV Builder | CV builder tool used |
+| TS Request Created | Timestamp: request created |
+| TS CV Start | Timestamp: CV work started |
+| TS CV Finished | Timestamp: CV work finished |
+| TS Request Processed | Timestamp: request processed |
+
 #### 2. CV Text Extraction (google_docs.py, used in main.py)
 - Fetches CV text from Google Docs/PDF/DOCX files
 - Tries Drive export first (more reliable), falls back to Docs API

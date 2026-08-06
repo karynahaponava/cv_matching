@@ -9,20 +9,25 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import requests
+import asyncio
 import numpy as np
 from fastapi import FastAPI, Query, BackgroundTasks
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func, or_
+from database.db import Base, SessionLocal, engine
+from database.models import Candidate, Submission, Vacancy
+from services.google_docs import get_doc_text
+from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
+from services.cv_parser import extract_all_from_text
+from services.fuzzy_search import fuzzy_search_candidates
+from services.matcher import calculate_match_score
+from services.embeddings import embed, cosine_similarity
+from services.tg_scraper import fetch_tg_channel_posts
 
-from db import Base, SessionLocal, engine
-from models import Candidate, Submission, Vacancy
-from google_docs import get_doc_text
-from google_sheets import sync_candidates_from_cloud
-from cv_parser import extract_all_from_text
-from fuzzy_search import fuzzy_search_candidates
-from matcher import calculate_match_score
-from embeddings import embed, cosine_similarity
+class TGSaveRequest(BaseModel):
+    channel: str
+    text: str
 
 
 class ImportExcelRequest(BaseModel):
@@ -48,6 +53,9 @@ class AnalyzeRequest(BaseModel):
     query: str
     cv_url: str
 
+class TGRequest(BaseModel):
+    url: str
+    limit: int = 10
 
 def update_status(text: str):
     """Helper function for writing the current status to a file"""
@@ -55,10 +63,12 @@ def update_status(text: str):
         f.write(text)
 
 
-def internal_update_cv_texts(days_limit: int = None):
-    """Downloading resume texts from Google Docs (optional for the last N days)"""
+async def internal_update_cv_texts(days_limit: int = None):
+    """Downloading resume texts from Google Docs asynchronously"""
     session = SessionLocal()
-    updated, skipped, errors = 0, 0, 0
+
+    stats = {"updated": 0, "skipped": 0, "errors": 0}
+
     try:
         query = session.query(Candidate).filter(
             or_(
@@ -74,31 +84,42 @@ def internal_update_cv_texts(days_limit: int = None):
         candidates = query.all()
         total = len(candidates)
         print(
-            f"\n[Парсер CV] Найдено {total} кандидатов для загрузки текста (Лимит дней: {days_limit})..."
+            f"\n[Парсер CV] Найдено {total} кандидатов для загрузки текста (Асинхронно)..."
         )
 
-        for i, cand in enumerate(candidates, 1):
-            if not cand.cv_url or "docs.google.com" not in cand.cv_url:
-                skipped += 1
-                continue
-            print(f"[{i}/{total}] Скачивание CV для: {cand.name[:20]}... ", end="")
-            try:
-                cv_text = get_doc_text(cand.cv_url)
-                if cv_text:
-                    cand.cv_text = cv_text
-                    updated += 1
-                    print("✅ УСПЕШНО")
-                else:
-                    errors += 1
-                    print("❌ ОШИБКА (Документ закрыт)")
-            except Exception:
-                errors += 1
-                print("⚠️ ОШИБКА СЕТИ")
+        if total == 0:
+            return stats
 
-            if i % 10 == 0:
-                session.commit()
+        semaphore = asyncio.Semaphore(5)
+
+        async def fetch_candidate(i, cand):
+            if not cand.cv_url or "docs.google.com" not in cand.cv_url:
+                stats["skipped"] += 1
+                return
+
+            async with semaphore:
+                print(f"[{i}/{total}] Старт скачивания CV для: {cand.name[:20]}...")
+                try:
+                    cv_text = await asyncio.to_thread(get_doc_text, cand.cv_url)
+
+                    if cv_text:
+                        cand.cv_text = cv_text
+                        stats["updated"] += 1
+                        print(f"✅ УСПЕШНО [{cand.name[:20]}]")
+                    else:
+                        stats["errors"] += 1
+                        print(f"❌ ОШИБКА Документ закрыт [{cand.name[:20]}]")
+                except Exception as e:
+                    stats["errors"] += 1
+                    print(f"⚠️ ОШИБКА СЕТИ для [{cand.name[:20]}]: {e}")
+
+        tasks = [fetch_candidate(i, cand) for i, cand in enumerate(candidates, 1)]
+
+        await asyncio.gather(*tasks)
+
         session.commit()
-        return {"updated": updated, "skipped": skipped, "errors": errors}
+        return stats
+
     finally:
         session.close()
 
@@ -158,22 +179,26 @@ def internal_build_embeddings(days_limit: int = None):
         session.close()
 
 
-def process_cvs_in_background(days_limit: int = None):
+async def process_cvs_in_background(days_limit: int = None):
     """Full background word processing, parsing and vectorization process"""
     try:
         mode_text = f"за последние {days_limit} дня" if days_limit else "для ВСЕЙ базы"
         update_status(f"Запуск синхронизации ({mode_text}). Шаг 1 завершен.")
 
         update_status(f"Шаг 2: Скачивание текстов резюме {mode_text}...")
-        res_cv = internal_update_cv_texts(days_limit=days_limit)
+        res_cv = await internal_update_cv_texts(days_limit=days_limit)
 
         update_status(f"Шаг 3: Анализ стека и извлечение направлений {mode_text}...")
-        res_stack = internal_parse_cv_stacks(days_limit=days_limit)
+        res_stack = await asyncio.to_thread(
+            internal_parse_cv_stacks, days_limit=days_limit
+        )
 
         update_status(
             f"Шаг 4: Расчет ИИ-векторов для семантического поиска {mode_text}..."
         )
-        res_ai = internal_build_embeddings(days_limit=days_limit)
+        res_ai = await asyncio.to_thread(
+            internal_build_embeddings, days_limit=days_limit
+        )
 
         update_status("🎉 Синхронизация полностью завершена! Все данные актуальны.")
     except Exception as e:
@@ -196,9 +221,82 @@ def nightly_maintenance_job():
     finally:
         session.close()
 
-    process_cvs_in_background(days_limit=2)
+    asyncio.run(process_cvs_in_background(days_limit=2))
     print("\n" + "=" * 50 + "\n")
 
+def scheduled_tg_parsing_job():
+    """Автоматический парсинг Telegram-каналов с использованием ватермарок (курсоров)"""
+    print("\n" + "=" * 50)
+    print(f"Старт автоматического парсинга ТГК с ватермарками: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 50)
+    
+    tg_channels_raw = os.getenv("TG_CHANNELS", "")
+    channels = list(dict.fromkeys([ch.strip() for ch in tg_channels_raw.split(",") if ch.strip()]))
+    
+    if not channels:
+        print("[Расписание ТГ] Список каналов в TG_CHANNELS пуст. Парсинг отменен.")
+        return
+
+    session = SessionLocal()
+    saved_count = 0
+
+    try:
+        for channel_url in channels:
+            channel_name = channel_url.strip("/").split("/")[-1]
+            print(f"[Расписание ТГ] Проверяем канал: @{channel_name}...")
+            
+            state = session.query(TelegramChannelState).filter_by(channel=channel_name).first()
+            if not state:
+                state = TelegramChannelState(channel=channel_name, last_post_id=0)
+                session.add(state)
+                session.flush() 
+
+            last_saved_id = state.last_post_id
+            
+            try:
+                posts = fetch_tg_channel_posts(channel_url, limit=20)
+                
+                new_posts = [p for p in posts if p.get('post_id', 0) > last_saved_id]
+                new_posts.sort(key=lambda x: x.get('post_id', 0))
+                
+                if not new_posts:
+                    print(f"  -> Нет новых постов. (Ватермарка на отметке ID: {last_saved_id})")
+                    continue
+                    
+                for post in new_posts:
+                    current_post_id = post.get('post_id', 0)
+                    
+                    exists_text = session.query(TelegramVacancy).filter_by(
+                        channel=post['channel'], 
+                        raw_text=post['text']
+                    ).first()
+                    
+                    if exists_text:
+                        state.last_post_id = current_post_id
+                        continue
+                        
+                    new_vac = TelegramVacancy(
+                        channel=post['channel'], 
+                        raw_text=post['text']
+                    )
+                    session.add(new_vac)
+                    saved_count += 1
+                    
+                    state.last_post_id = current_post_id
+                    
+                print(f"  -> Успешно обработано и сохранено новых постов: {len(new_posts)}")
+                
+            except Exception as e:
+                print(f"[Расписание ТГ] Ошибка при обработке канала @{channel_name}: {e}")
+                
+        session.commit()
+        print(f"[Расписание ТГ] Скрипт отработал. Всего добавлено записей за этот цикл: {saved_count}")
+    except Exception as e:
+        session.rollback()
+        print(f"[Расписание ТГ] Глобальная ошибка планировщика: {e}")
+    finally:
+        session.close()
+    print("=" * 50 + "\n")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -207,6 +305,11 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         nightly_maintenance_job, "cron", hour=1, minute=0, misfire_grace_time=3600
     )
+
+    scheduler.add_job(
+        scheduled_tg_parsing_job, "interval", hours=4, misfire_grace_time=600
+    )
+
     scheduler.start()
     print("⏰ Планировщик запущен! Единая ночная сборка назначена на 01:00.")
     print("   Правило: Вся таблица Excel ➡️ Дельта за 2 дня (Тексты, Стек, ИИ-векторы)")
@@ -246,10 +349,8 @@ def sync_excel(background_tasks: BackgroundTasks):
 
 
 @app.post("/update-cv-texts")
-def update_cv_texts(
-    days_limit: int = Query(None, description="Лимит дней для проверки (None = все)")
-):
-    return internal_update_cv_texts(days_limit=days_limit)
+async def update_cv_texts(days_limit: int = Query(None)):
+    return await internal_update_cv_texts(days_limit=days_limit)
 
 
 @app.post("/parse-cv-stacks")
@@ -303,7 +404,7 @@ def semantic_match(request: SemanticMatchRequest):
             request.target_broker.strip().lower(),
         )
 
-        from fuzzy_search import get_candidate_badge
+        from services.fuzzy_search import get_candidate_badge
 
         matched_cands = []
         for c in candidates:
@@ -392,7 +493,7 @@ def get_sync_status():
 
 @app.post("/analyze-cv")
 def analyze_cv(request: AnalyzeRequest):
-    from embeddings import model, cosine_similarity, embed
+    from services.embeddings import model, cosine_similarity, embed
 
     session = SessionLocal()
     try:
@@ -460,6 +561,72 @@ def analyze_cv(request: AnalyzeRequest):
         session.close()
 
 
+@app.post("/sync-vacancies")
+def sync_vacancies(backfill: bool = Query(False)):
+    session = SessionLocal()
+    try:
+        stats = sync_vacancies_from_cloud(session, backfill=backfill)
+        return {"status": "success", "stats": stats}
+    except Exception as e:
+        session.rollback()
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@app.get("/vacancies")
+def get_vacancies(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    department: str = Query(None),
+):
+    session = SessionLocal()
+    try:
+        query = session.query(Vacancy)
+        if department:
+            query = query.filter(Vacancy.department == department)
+        total = query.with_entities(func.count(Vacancy.id)).scalar()
+        rows = (
+            query.order_by(Vacancy.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [
+                {
+                    "id": v.id,
+                    "thread_id": v.thread_id,
+                    "title": v.title,
+                    "department": v.department,
+                    "requirements": v.requirements,
+                    "created_at": v.created_at.isoformat() if v.created_at else None,
+                }
+                for v in rows
+            ],
+        }
+    finally:
+        session.close()
+
+
+@app.get("/vacancy-departments")
+def get_vacancy_departments():
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(Vacancy.department)
+            .filter(Vacancy.department != "N/A")
+            .distinct()
+            .all()
+        )
+        return sorted([r[0] for r in rows])
+    finally:
+        session.close()
+
+
 @app.get("/departments")
 def get_departments():
     session = SessionLocal()
@@ -472,5 +639,64 @@ def get_departments():
         )
 
         return sorted([d[0] for d in deps])
+    finally:
+        session.close()
+
+@app.post("/parse-tg")
+def parse_tg_endpoint(req: TGRequest):
+    try:
+        posts = fetch_tg_channel_posts(req.url, req.limit)
+        return {"status": "success", "posts": posts}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.post("/save-tg-vacancy")
+def save_tg_vacancy(req: TGSaveRequest):
+    session = SessionLocal()
+    try:
+        exists = session.query(TelegramVacancy).filter_by(
+            channel=req.channel, 
+            raw_text=req.text
+        ).first()
+        
+        if exists:
+            return {"status": "ignored", "message": "Этот пост уже есть в базе"}
+
+        new_vac = TelegramVacancy(
+            channel=req.channel, 
+            raw_text=req.text
+        )
+        session.add(new_vac)
+        session.commit()
+        return {"status": "success"}
+    except Exception as e:
+        session.rollback()
+        return {"status": "error", "detail": str(e)}
+    finally:
+        session.close()
+
+@app.get("/saved-tg-vacancies")
+def get_saved_tg_vacancies(
+    page: int = Query(1, ge=1), 
+    page_size: int = Query(20, ge=1, le=100)
+):
+    session = SessionLocal()
+    try:
+        total = session.query(TelegramVacancy).count()
+        rows = (
+            session.query(TelegramVacancy)
+            .order_by(TelegramVacancy.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [{"id": v.id, "channel": v.channel, "text": v.raw_text} for v in rows]
+        }
+    except Exception as e:
+        return {"error": str(e)}
     finally:
         session.close()

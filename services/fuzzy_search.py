@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from sqlalchemy import text
-from models import Candidate, Submission
-from db import SessionLocal
+from database.models import Candidate, Submission
+from database.db import SessionLocal
 
 from datetime import datetime, timedelta
 
