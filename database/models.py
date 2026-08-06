@@ -1,6 +1,5 @@
 from datetime import datetime
 import pandas as pd
-
 from sqlalchemy import (
     Column,
     DateTime,
@@ -59,8 +58,17 @@ class Submission(Base):
     request_result = Column(String)
     submitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    @validates('submitted_at')
-    def validate_submitted_at(self, key, value):
-        if value is None or pd.isna(value) or str(value).strip() in ["", "NaT"]:
-            return datetime.utcnow()
-        return value
+class TelegramVacancy(Base):
+    __tablename__ = "telegram_vacancies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    channel = Column(String, index=True)
+    raw_text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class TelegramChannelState(Base):
+    __tablename__ = "telegram_channel_states"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    channel = Column(String, unique=True, index=True, nullable=False)
+    last_post_id = Column(Integer, default=0, nullable=False)

@@ -159,11 +159,17 @@ with st.sidebar:
 st.title("CV Matching System")
 
 st.subheader("Поиск кандидатов по требованиям")
+
 query = st.text_area(
     "Введите стек или требования для поиска",
+    value=st.session_state.get("saved_query", ""),
     placeholder="Например: python fastapi postgresql docker",
     height=100,
+    key="search_query_input"
 )
+
+if "auto_search_query" in st.session_state:
+    del st.session_state["auto_search_query"]
 
 col1, col2, col3 = st.columns(3)
 with col1:

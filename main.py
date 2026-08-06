@@ -15,7 +15,6 @@ from fastapi import FastAPI, Query, BackgroundTasks
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func, or_
-
 from database.db import Base, SessionLocal, engine
 from database.models import Candidate, Submission, Vacancy
 from services.google_docs import get_doc_text
@@ -24,6 +23,11 @@ from services.cv_parser import extract_all_from_text
 from services.fuzzy_search import fuzzy_search_candidates
 from services.matcher import calculate_match_score
 from services.embeddings import embed, cosine_similarity
+from services.tg_scraper import fetch_tg_channel_posts
+
+class TGSaveRequest(BaseModel):
+    channel: str
+    text: str
 
 
 class ImportExcelRequest(BaseModel):
@@ -49,6 +53,9 @@ class AnalyzeRequest(BaseModel):
     query: str
     cv_url: str
 
+class TGRequest(BaseModel):
+    url: str
+    limit: int = 10
 
 def update_status(text: str):
     """Helper function for writing the current status to a file"""
@@ -217,6 +224,79 @@ def nightly_maintenance_job():
     asyncio.run(process_cvs_in_background(days_limit=2))
     print("\n" + "=" * 50 + "\n")
 
+def scheduled_tg_parsing_job():
+    """Автоматический парсинг Telegram-каналов с использованием ватермарок (курсоров)"""
+    print("\n" + "=" * 50)
+    print(f"Старт автоматического парсинга ТГК с ватермарками: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 50)
+    
+    tg_channels_raw = os.getenv("TG_CHANNELS", "")
+    channels = list(dict.fromkeys([ch.strip() for ch in tg_channels_raw.split(",") if ch.strip()]))
+    
+    if not channels:
+        print("[Расписание ТГ] Список каналов в TG_CHANNELS пуст. Парсинг отменен.")
+        return
+
+    session = SessionLocal()
+    saved_count = 0
+
+    try:
+        for channel_url in channels:
+            channel_name = channel_url.strip("/").split("/")[-1]
+            print(f"[Расписание ТГ] Проверяем канал: @{channel_name}...")
+            
+            state = session.query(TelegramChannelState).filter_by(channel=channel_name).first()
+            if not state:
+                state = TelegramChannelState(channel=channel_name, last_post_id=0)
+                session.add(state)
+                session.flush() 
+
+            last_saved_id = state.last_post_id
+            
+            try:
+                posts = fetch_tg_channel_posts(channel_url, limit=20)
+                
+                new_posts = [p for p in posts if p.get('post_id', 0) > last_saved_id]
+                new_posts.sort(key=lambda x: x.get('post_id', 0))
+                
+                if not new_posts:
+                    print(f"  -> Нет новых постов. (Ватермарка на отметке ID: {last_saved_id})")
+                    continue
+                    
+                for post in new_posts:
+                    current_post_id = post.get('post_id', 0)
+                    
+                    exists_text = session.query(TelegramVacancy).filter_by(
+                        channel=post['channel'], 
+                        raw_text=post['text']
+                    ).first()
+                    
+                    if exists_text:
+                        state.last_post_id = current_post_id
+                        continue
+                        
+                    new_vac = TelegramVacancy(
+                        channel=post['channel'], 
+                        raw_text=post['text']
+                    )
+                    session.add(new_vac)
+                    saved_count += 1
+                    
+                    state.last_post_id = current_post_id
+                    
+                print(f"  -> Успешно обработано и сохранено новых постов: {len(new_posts)}")
+                
+            except Exception as e:
+                print(f"[Расписание ТГ] Ошибка при обработке канала @{channel_name}: {e}")
+                
+        session.commit()
+        print(f"[Расписание ТГ] Скрипт отработал. Всего добавлено записей за этот цикл: {saved_count}")
+    except Exception as e:
+        session.rollback()
+        print(f"[Расписание ТГ] Глобальная ошибка планировщика: {e}")
+    finally:
+        session.close()
+    print("=" * 50 + "\n")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -225,6 +305,11 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         nightly_maintenance_job, "cron", hour=1, minute=0, misfire_grace_time=3600
     )
+
+    scheduler.add_job(
+        scheduled_tg_parsing_job, "interval", hours=4, misfire_grace_time=600
+    )
+
     scheduler.start()
     print("⏰ Планировщик запущен! Единая ночная сборка назначена на 01:00.")
     print("   Правило: Вся таблица Excel ➡️ Дельта за 2 дня (Тексты, Стек, ИИ-векторы)")
@@ -547,5 +632,64 @@ def get_departments():
         )
 
         return sorted([d[0] for d in deps])
+    finally:
+        session.close()
+
+@app.post("/parse-tg")
+def parse_tg_endpoint(req: TGRequest):
+    try:
+        posts = fetch_tg_channel_posts(req.url, req.limit)
+        return {"status": "success", "posts": posts}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.post("/save-tg-vacancy")
+def save_tg_vacancy(req: TGSaveRequest):
+    session = SessionLocal()
+    try:
+        exists = session.query(TelegramVacancy).filter_by(
+            channel=req.channel, 
+            raw_text=req.text
+        ).first()
+        
+        if exists:
+            return {"status": "ignored", "message": "Этот пост уже есть в базе"}
+
+        new_vac = TelegramVacancy(
+            channel=req.channel, 
+            raw_text=req.text
+        )
+        session.add(new_vac)
+        session.commit()
+        return {"status": "success"}
+    except Exception as e:
+        session.rollback()
+        return {"status": "error", "detail": str(e)}
+    finally:
+        session.close()
+
+@app.get("/saved-tg-vacancies")
+def get_saved_tg_vacancies(
+    page: int = Query(1, ge=1), 
+    page_size: int = Query(20, ge=1, le=100)
+):
+    session = SessionLocal()
+    try:
+        total = session.query(TelegramVacancy).count()
+        rows = (
+            session.query(TelegramVacancy)
+            .order_by(TelegramVacancy.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [{"id": v.id, "channel": v.channel, "text": v.raw_text} for v in rows]
+        }
+    except Exception as e:
+        return {"error": str(e)}
     finally:
         session.close()
