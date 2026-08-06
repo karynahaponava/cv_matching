@@ -201,39 +201,17 @@ if "auto_search_query" in st.session_state:
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    target_client = st.text_input("Конечный клиент", value="")
+    target_client = st.text_input("Конечный клиент", value="", key="target_client_input")
 with col2:
-    target_broker = st.text_input("Брокер / Посредник", value="")
+    target_broker = st.text_input("Брокер / Посредник", value="", key="target_broker_input")
 with col3:
     try:
         dep_res = _api_get("/departments", timeout_s=5)
         available_departments = dep_res.json() if dep_res.ok else []
     except:
         available_departments = []
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    target_client = st.text_input(
-        "Конечный клиент", 
-        value="", 
-        on_change=_reset_search_results
-    )
-
-with col2:
-    target_broker = st.text_input(
-        "Брокер / Посредник", 
-        value="", 
-        on_change=_reset_search_results
-    )
-
-with col3:
-    selected_depts = st.multiselect(
-        "Отделы", 
-        available_departments,
-        placeholder="Все отделы (или выберите)",
-        on_change=_reset_search_results
-    )
+        
+selected_depts = st.multiselect("Отделы", options=available_departments, key="selected_depts_input")
 
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
 semantic_enabled = st.checkbox(
