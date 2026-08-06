@@ -9,14 +9,14 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import requests
+import asyncio
 import numpy as np
 from fastapi import FastAPI, Query, BackgroundTasks
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func, or_
-
-from db import Base, SessionLocal, engine
-from models import Candidate, Submission, Vacancy, TelegramVacancy, TelegramChannelState
+from database.db import Base, SessionLocal, engine
+from database.models import Candidate, Submission, Vacancy
 from services.google_docs import get_doc_text
 from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
 from services.cv_parser import extract_all_from_text
@@ -63,10 +63,12 @@ def update_status(text: str):
         f.write(text)
 
 
-def internal_update_cv_texts(days_limit: int = None):
-    """Downloading resume texts from Google Docs (optional for the last N days)"""
+async def internal_update_cv_texts(days_limit: int = None):
+    """Downloading resume texts from Google Docs asynchronously"""
     session = SessionLocal()
-    updated, skipped, errors = 0, 0, 0
+
+    stats = {"updated": 0, "skipped": 0, "errors": 0}
+
     try:
         query = session.query(Candidate).filter(
             or_(
@@ -82,31 +84,42 @@ def internal_update_cv_texts(days_limit: int = None):
         candidates = query.all()
         total = len(candidates)
         print(
-            f"\n[Парсер CV] Найдено {total} кандидатов для загрузки текста (Лимит дней: {days_limit})..."
+            f"\n[Парсер CV] Найдено {total} кандидатов для загрузки текста (Асинхронно)..."
         )
 
-        for i, cand in enumerate(candidates, 1):
-            if not cand.cv_url or "docs.google.com" not in cand.cv_url:
-                skipped += 1
-                continue
-            print(f"[{i}/{total}] Скачивание CV для: {cand.name[:20]}... ", end="")
-            try:
-                cv_text = get_doc_text(cand.cv_url)
-                if cv_text:
-                    cand.cv_text = cv_text
-                    updated += 1
-                    print("✅ УСПЕШНО")
-                else:
-                    errors += 1
-                    print("❌ ОШИБКА (Документ закрыт)")
-            except Exception:
-                errors += 1
-                print("⚠️ ОШИБКА СЕТИ")
+        if total == 0:
+            return stats
 
-            if i % 10 == 0:
-                session.commit()
+        semaphore = asyncio.Semaphore(5)
+
+        async def fetch_candidate(i, cand):
+            if not cand.cv_url or "docs.google.com" not in cand.cv_url:
+                stats["skipped"] += 1
+                return
+
+            async with semaphore:
+                print(f"[{i}/{total}] Старт скачивания CV для: {cand.name[:20]}...")
+                try:
+                    cv_text = await asyncio.to_thread(get_doc_text, cand.cv_url)
+
+                    if cv_text:
+                        cand.cv_text = cv_text
+                        stats["updated"] += 1
+                        print(f"✅ УСПЕШНО [{cand.name[:20]}]")
+                    else:
+                        stats["errors"] += 1
+                        print(f"❌ ОШИБКА Документ закрыт [{cand.name[:20]}]")
+                except Exception as e:
+                    stats["errors"] += 1
+                    print(f"⚠️ ОШИБКА СЕТИ для [{cand.name[:20]}]: {e}")
+
+        tasks = [fetch_candidate(i, cand) for i, cand in enumerate(candidates, 1)]
+
+        await asyncio.gather(*tasks)
+
         session.commit()
-        return {"updated": updated, "skipped": skipped, "errors": errors}
+        return stats
+
     finally:
         session.close()
 
@@ -166,22 +179,26 @@ def internal_build_embeddings(days_limit: int = None):
         session.close()
 
 
-def process_cvs_in_background(days_limit: int = None):
+async def process_cvs_in_background(days_limit: int = None):
     """Full background word processing, parsing and vectorization process"""
     try:
         mode_text = f"за последние {days_limit} дня" if days_limit else "для ВСЕЙ базы"
         update_status(f"Запуск синхронизации ({mode_text}). Шаг 1 завершен.")
 
         update_status(f"Шаг 2: Скачивание текстов резюме {mode_text}...")
-        res_cv = internal_update_cv_texts(days_limit=days_limit)
+        res_cv = await internal_update_cv_texts(days_limit=days_limit)
 
         update_status(f"Шаг 3: Анализ стека и извлечение направлений {mode_text}...")
-        res_stack = internal_parse_cv_stacks(days_limit=days_limit)
+        res_stack = await asyncio.to_thread(
+            internal_parse_cv_stacks, days_limit=days_limit
+        )
 
         update_status(
             f"Шаг 4: Расчет ИИ-векторов для семантического поиска {mode_text}..."
         )
-        res_ai = internal_build_embeddings(days_limit=days_limit)
+        res_ai = await asyncio.to_thread(
+            internal_build_embeddings, days_limit=days_limit
+        )
 
         update_status("🎉 Синхронизация полностью завершена! Все данные актуальны.")
     except Exception as e:
@@ -204,7 +221,7 @@ def nightly_maintenance_job():
     finally:
         session.close()
 
-    process_cvs_in_background(days_limit=2)
+    asyncio.run(process_cvs_in_background(days_limit=2))
     print("\n" + "=" * 50 + "\n")
 
 def scheduled_tg_parsing_job():
@@ -332,10 +349,8 @@ def sync_excel(background_tasks: BackgroundTasks):
 
 
 @app.post("/update-cv-texts")
-def update_cv_texts(
-    days_limit: int = Query(None, description="Лимит дней для проверки (None = все)")
-):
-    return internal_update_cv_texts(days_limit=days_limit)
+async def update_cv_texts(days_limit: int = Query(None)):
+    return await internal_update_cv_texts(days_limit=days_limit)
 
 
 @app.post("/parse-cv-stacks")
@@ -564,7 +579,12 @@ def get_vacancies(
         if department:
             query = query.filter(Vacancy.department == department)
         total = query.with_entities(func.count(Vacancy.id)).scalar()
-        rows = query.order_by(Vacancy.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+        rows = (
+            query.order_by(Vacancy.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
         return {
             "total": total,
             "page": page,
@@ -589,7 +609,12 @@ def get_vacancies(
 def get_vacancy_departments():
     session = SessionLocal()
     try:
-        rows = session.query(Vacancy.department).filter(Vacancy.department != "N/A").distinct().all()
+        rows = (
+            session.query(Vacancy.department)
+            .filter(Vacancy.department != "N/A")
+            .distinct()
+            .all()
+        )
         return sorted([r[0] for r in rows])
     finally:
         session.close()

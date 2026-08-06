@@ -17,10 +17,17 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    op.create_table(
+        "vacancies",
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column("title", sa.String(), nullable=False),
+        sa.Column("requirements", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.text("now()")),
+    )
     # server_default="0" satisfies NOT NULL for existing rows; dropped immediately after
     op.add_column("vacancies", sa.Column("thread_id", sa.Integer(), nullable=False, server_default="0"))
     op.alter_column("vacancies", "thread_id", server_default=None)
 
 
 def downgrade() -> None:
-    op.drop_column("vacancies", "thread_id")
+    op.drop_table("vacancies")
