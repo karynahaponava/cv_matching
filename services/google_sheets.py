@@ -144,8 +144,6 @@ def sync_candidates_from_cloud(session):
                     submitted_at = pd.to_datetime(
                         raw_date, dayfirst=True
                     ).to_pydatetime()
-                    if pd.isna(submitted_at):
-                        submitted_at = None
                 except Exception as e:
                     print(f"Ошибка парсинга даты '{raw_date}' для {name}: {e}")
                     submitted_at = None
