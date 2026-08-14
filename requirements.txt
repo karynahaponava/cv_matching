@@ -8,12 +8,13 @@ openpyxl
 google-auth
 google-auth-oauthlib
 google-api-python-client
-streamlit
+streamlit >= 1.33.0
+starlette==0.36.3
 requests
 python-dotenv
 apscheduler
 numpy
 sentence-transformers
 python-docx
-PyPDF2 
+PyPDF2
 beautifulsoup4==4.12.3

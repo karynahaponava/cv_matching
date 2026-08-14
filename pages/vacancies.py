@@ -89,7 +89,9 @@ else:
     for vac in items:
         with st.container(border=True):
             col_title, col_dept, col_date = st.columns([4, 2, 2])
-            col_title.markdown(f"**{vac['thread_id']}  {vac['title']}**")
+            thread_val = vac.get('thread_id')
+            thread_prefix = f"#{thread_val} | " if thread_val else ""
+            col_title.markdown(f"**{thread_prefix}{vac['title']}**")
             col_dept.caption(vac.get("department") or "")
             created = vac.get("created_at", "")
             if created:
