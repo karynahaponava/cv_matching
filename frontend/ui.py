@@ -233,12 +233,23 @@ with col2:
 with col3:
     try:
         dep_res = _api_get("/departments", timeout_s=5)
-        available_departments = dep_res.json() if dep_res.ok else []
+        raw_depts = dep_res.json() if dep_res.ok else []
+        
+        cleaned_depts = set()
+        for d in raw_depts:
+            if d:
+                normalized = d.replace('C', 'С').replace('c', 'с').strip()
+                cleaned_depts.add(normalized)
+
+        available_departments = sorted(list(cleaned_depts))
     except:
         available_departments = []
-
+        
 selected_depts = st.multiselect(
-    "Отделы", options=available_departments, key="selected_depts_input"
+    "Отделы", 
+    options=available_departments, 
+    key="selected_depts_input",
+    placeholder="Выберите отдел"
 )
 
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
