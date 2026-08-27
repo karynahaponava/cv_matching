@@ -330,6 +330,9 @@ def root():
 def sync_excel(background_tasks: BackgroundTasks):
     session = SessionLocal()
     try:
+        update_status(
+            "Шаг 1: Загрузка данных из Google Sheets для ВСЕЙ базы..."
+        )
         print("\n" + "=" * 60)
         print("[Ручной запуск] Шаг 1: Скачивание всей таблицы из Google Sheets...")
         stats = sync_candidates_from_cloud(session)
@@ -343,6 +346,7 @@ def sync_excel(background_tasks: BackgroundTasks):
         }
     except Exception as e:
         session.rollback()
+        update_status(f"❌ Синхронизация прервана из-за ошибки: {e}")
         return {"status": "error", "message": str(e)}
     finally:
         session.close()
