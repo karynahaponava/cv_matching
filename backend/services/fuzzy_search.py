@@ -144,8 +144,16 @@ def fuzzy_search_candidates(
     target_client: str = None,
     target_broker: str = None,
     threshold: float = 0.3,
+    departments: list[str] | None = None,
 ) -> list[dict]:
     cleaned = [k.strip().lower() for k in keywords if k and k.strip()]
+
+    cleaned_departments = [
+        department.strip()
+        for department in (departments or [])
+        if department and department.strip()
+    ]
+
     if not cleaned:
         return []
 
@@ -166,6 +174,10 @@ def fuzzy_search_candidates(
                 ) AS sim
             FROM candidates c
             CROSS JOIN kw
+            WHERE (
+                COALESCE(cardinality(CAST(:departments AS text[])), 0) = 0
+                OR c.direction = ANY(CAST(:departments AS text[]))
+            )
         ),
         aggregated AS (
             SELECT
@@ -188,7 +200,11 @@ def fuzzy_search_candidates(
         rows = (
             session.execute(
                 sql,
-                {"keywords": cleaned, "threshold": threshold},
+                {
+                    "keywords": cleaned,
+                    "threshold": threshold,
+                    "departments": cleaned_departments,
+                },
             )
             .mappings()
             .all()

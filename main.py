@@ -372,10 +372,11 @@ def build_embeddings(
 @app.post("/fuzzy-match")
 def fuzzy_match(request: FuzzyMatchRequest):
     return fuzzy_search_candidates(
-        request.keywords,
-        request.target_client,
-        request.target_broker,
-        request.threshold,
+        keywords=request.keywords,
+        target_client=request.target_client,
+        target_broker=request.target_broker,
+        threshold=request.threshold,
+        departments=request.departments,
     )
 
 
