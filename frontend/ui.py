@@ -9,6 +9,7 @@ API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 _KW_RE = re.compile(r"[a-zA-Zа-яА-Я0-9\.+#][a-zA-Zа-яА-Я0-9+#\.\-_/]*")
 
+
 def _api_get(
     path: str, params: dict | None = None, timeout_s: int = 20
 ) -> requests.Response:
@@ -101,13 +102,15 @@ def _render_search_results(
             if cv_url:
                 st.caption(f"Постоянная ссылка: {cv_url}")
 
+
 def _reset_search_results():
     st.session_state.search_results = None
 
 
 st.set_page_config(page_title="CV Matching UI", layout="wide")
 
-st.markdown("""
+st.markdown(
+    """
     <style>
         header[data-testid="stHeader"] {
             position: static !important;
@@ -132,12 +135,28 @@ st.markdown("""
             min-width: 0 !important;
         }
     </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.header("Синхронизация данных")
 
-    if st.button("Синхронизация", use_container_width=True, type="primary"):
+    if "is_syncing" not in st.session_state:
+        st.session_state.is_syncing = False
+
+    def set_syncing():
+        st.session_state.is_syncing = True
+
+    st.button(
+        "Синхронизация",
+        use_container_width=True,
+        type="primary",
+        on_click=set_syncing,
+        disabled=st.session_state.is_syncing,
+    )
+
+    if st.session_state.is_syncing:
         with st.spinner("Отправка команды на сервер..."):
             try:
                 res = _api_post("/sync-excel")
@@ -183,6 +202,9 @@ with st.sidebar:
                     st.error(f"Ошибка сервера: {res.status_code}")
             except Exception as e:
                 st.error(f"Ошибка подключения к API: {e}")
+            finally:
+                st.session_state.is_syncing = False
+                st.rerun()
 
 st.title("CV Matching System")
 
@@ -193,7 +215,7 @@ query = st.text_area(
     value=st.session_state.get("saved_query", ""),
     placeholder="Например: python fastapi postgresql docker",
     height=100,
-    key="search_query_input"
+    key="search_query_input",
 )
 
 if "auto_search_query" in st.session_state:
@@ -201,17 +223,34 @@ if "auto_search_query" in st.session_state:
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    target_client = st.text_input("Конечный клиент", value="", key="target_client_input")
+    target_client = st.text_input(
+        "Конечный клиент", value="", key="target_client_input"
+    )
 with col2:
-    target_broker = st.text_input("Брокер / Посредник", value="", key="target_broker_input")
+    target_broker = st.text_input(
+        "Брокер / Посредник", value="", key="target_broker_input"
+    )
 with col3:
     try:
         dep_res = _api_get("/departments", timeout_s=5)
-        available_departments = dep_res.json() if dep_res.ok else []
+        raw_depts = dep_res.json() if dep_res.ok else []
+        
+        cleaned_depts = set()
+        for d in raw_depts:
+            if d:
+                normalized = d.replace('C', 'С').replace('c', 'с').strip()
+                cleaned_depts.add(normalized)
+
+        available_departments = sorted(list(cleaned_depts))
     except:
         available_departments = []
         
-selected_depts = st.multiselect("Отделы", options=available_departments, key="selected_depts_input")
+selected_depts = st.multiselect(
+    "Отделы", 
+    options=available_departments, 
+    key="selected_depts_input",
+    placeholder="Выберите отдел"
+)
 
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
 semantic_enabled = st.checkbox(
@@ -310,4 +349,4 @@ if st.session_state.search_results is not None:
     if limit < len(st.session_state.search_results):
         if st.button("Показать еще 50"):
             st.session_state.display_limit += 50
-            st.rerun() 
+            st.rerun()
