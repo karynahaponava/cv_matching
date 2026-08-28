@@ -23,7 +23,7 @@ def _api_post(
 
 def _extract_keywords(query: str) -> list[str]:
     q = (query or "").lower()
-    kws = [k for k in _KW_RE.findall(q) if len(k) >= 2]
+    kws = [k for k in _KW_RE.findall(q) if len(k) >= 1]
     return list(dict.fromkeys(kws))[:30]
 
 
