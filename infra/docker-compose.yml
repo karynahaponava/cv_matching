@@ -4,19 +4,40 @@ services:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}
       POSTGRES_DB: cv_matching
+    networks:
+      - internal_net
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
-    ports:
-      - "5432:5432"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 10
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
   backend:
     build:
       context: ../backend
@@ -28,11 +49,10 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/cv_matching
-    ports:
-      - "8000:8000"
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}@db:5432/cv_matching
+    networks:
+      - internal_net
     volumes:
-      - ../backend:/app
       - ../google_creds.json:/app/google_creds.json:ro
     restart: unless-stopped
     healthcheck:
@@ -41,6 +61,22 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2G
+        reservations:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
   frontend:
     build:
       context: ../frontend
@@ -49,14 +85,80 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-    env_file:
-      - .env
     environment:
       API_BASE_URL: http://backend:8000
-    ports:
-      - "8501:8501"
-    volumes:
-      - ../frontend:/app
+      TG_CHANNELS: ${TG_CHANNELS:-}
+    networks:
+      - internal_net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  nginx:
+    image: jonasal/nginx-certbot:6.1.0-nginx1.29.5
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./data/nginx/templates:/etc/nginx/templates:ro
+      - ./data/certbot:/etc/letsencrypt
+    environment:
+      CERTBOT_EMAIL: "pavlo.krasko@techcoredev.ru"
+      DOMAIN: ${DOMAIN:?DOMAIN is not set}
+      ENVSUBST_VARS: DOMAIN
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx/user_conf.d
+      STAGING: "1"   # переключить на "0" после успешного первого прохода
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - internal_net
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 256M
+        reservations:
+          memory: 64M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+networks:
+  internal_net:
+    driver: bridge
 volumes:
   pg_data:

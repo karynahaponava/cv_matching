@@ -390,9 +390,6 @@ def semantic_match(request: SemanticMatchRequest):
         ai_query = request.query
         
         ai_query = re.sub(r'(?i)\bgo\b', 'golang', ai_query)
-        
-        if len(request.query.split()) <= 2:
-            ai_query += " разработчик IT"
 
         query_vec = embed(ai_query)
 
