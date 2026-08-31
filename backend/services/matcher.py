@@ -9,7 +9,7 @@ def calculate_match_score(requirements: str, candidate_text: str) -> float:
     req = (requirements or "").lower()
     text = (candidate_text or "").lower()
 
-    keywords = [k for k in _KEYWORD_RE.findall(req) if len(k) >= 2]
+    keywords = [k for k in _KEYWORD_RE.findall(req) if len(k) >= 1]
     if not keywords:
         return 0.0
 
