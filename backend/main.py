@@ -1,4 +1,5 @@
 import re
+import threading
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 import os
@@ -12,8 +13,9 @@ import requests
 import asyncio
 import numpy as np
 from fastapi import FastAPI, Query, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from apscheduler.schedulers.background import BackgroundScheduler
+from googleapiclient.errors import HttpError as GoogleHttpError
 from sqlalchemy import func, or_
 from database.db import Base, SessionLocal, engine
 from database.models import (
@@ -30,6 +32,15 @@ from services.fuzzy_search import fuzzy_search_candidates
 from services.matcher import calculate_match_score
 from services.embeddings import embed, cosine_similarity
 from services.tg_scraper import fetch_tg_channel_posts
+from api_errors import (
+    ApiError,
+    ERROR_RESPONSES,
+    external_service_error,
+    install_error_handlers,
+)
+
+
+_sync_lock = threading.Lock()
 
 
 class TGSaveRequest(BaseModel):
@@ -42,18 +53,18 @@ class ImportExcelRequest(BaseModel):
 
 
 class FuzzyMatchRequest(BaseModel):
-    keywords: list[str]
-    threshold: float = 0.1
+    keywords: list[str] = Field(min_length=1, max_length=30)
+    threshold: float = Field(default=0.1, ge=0, le=1)
     target_client: str = ""
     target_broker: str = ""
-    departments: list[str] = []
+    departments: list[str] = Field(default_factory=list)
 
 
 class SemanticMatchRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=5000)
     target_client: str = ""
     target_broker: str = ""
-    departments: list[str] = []
+    departments: list[str] = Field(default_factory=list)
 
 
 class AnalyzeRequest(BaseModel):
@@ -214,24 +225,40 @@ async def process_cvs_in_background(days_limit: int = None):
         update_status(f"❌ Процесс прерван из-за ошибки: {e}")
 
 
+async def process_manual_sync_in_background():
+    try:
+        await process_cvs_in_background(days_limit=None)
+    finally:
+        _sync_lock.release()
+
+
 def nightly_maintenance_job():
     """Automatic nightly build: Updates the structure COMPLETELY, but only parses the last 2 days"""
-    print("\n" + "=" * 50)
-    print(f"Старт ночного обслуживания: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 50)
+    if not _sync_lock.acquire(blocking=False):
+        print("[Ночная синхронизация] Пропущена: другая синхронизация уже выполняется")
+        return
 
-    print("\nШАГ 1: Полная синхронизация структуры и статусов с Excel...")
-    session = SessionLocal()
     try:
-        stats = sync_candidates_from_cloud(session)
-        print(f"✅ Excel синхронизирован: {stats}")
-    except Exception as e:
-        print(f"❌ Ошибка Excel: {e}")
-    finally:
-        session.close()
+        print("\n" + "=" * 50)
+        print(
+            f"Старт ночного обслуживания: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        print("=" * 50)
 
-    asyncio.run(process_cvs_in_background(days_limit=2))
-    print("\n" + "=" * 50 + "\n")
+        print("\nШАГ 1: Полная синхронизация структуры и статусов с Excel...")
+        session = SessionLocal()
+        try:
+            stats = sync_candidates_from_cloud(session)
+            print(f"✅ Excel синхронизирован: {stats}")
+        except Exception as e:
+            print(f"❌ Ошибка Excel: {e}")
+        finally:
+            session.close()
+
+        asyncio.run(process_cvs_in_background(days_limit=2))
+        print("\n" + "=" * 50 + "\n")
+    finally:
+        _sync_lock.release()
 
 
 def scheduled_tg_parsing_job():
@@ -346,50 +373,87 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+install_error_handlers(app)
 
 
-@app.get("/")
+@app.get("/", responses=ERROR_RESPONSES)
 def root():
     return {"status": "ok"}
 
 
-@app.post("/sync-excel")
+@app.post("/sync-excel", responses=ERROR_RESPONSES)
 def sync_excel(background_tasks: BackgroundTasks):
-    session = SessionLocal()
+    if not _sync_lock.acquire(blocking=False):
+        raise ApiError(
+            409,
+            "SYNC_IN_PROGRESS",
+            "Синхронизация уже выполняется",
+        )
+
+    session = None
+    lock_handed_off = False
     try:
+        session = SessionLocal()
         update_status("Шаг 1: Загрузка данных из Google Sheets для ВСЕЙ базы...")
         print("\n" + "=" * 60)
         print("[Ручной запуск] Шаг 1: Скачивание всей таблицы из Google Sheets...")
         stats = sync_candidates_from_cloud(session)
         print(f"✅ Шаг 1 завершен. Статистика: {stats}")
 
-        background_tasks.add_task(process_cvs_in_background, days_limit=None)
+        background_tasks.add_task(process_manual_sync_in_background)
+        lock_handed_off = True
 
         return {
             "status": "success",
             "message": f"Таблица успешно загружена (Новых: {stats.get('added_candidates', 0)}). Тотальный перепарсинг ВСЕЙ базы и расчет ИИ-векторов запущены!",
         }
-    except Exception as e:
-        session.rollback()
-        update_status(f"❌ Синхронизация прервана из-за ошибки: {e}")
-        return {"status": "error", "message": str(e)}
+    except (TimeoutError, asyncio.TimeoutError, requests.Timeout) as exc:
+        if session is not None:
+            session.rollback()
+        update_status("❌ Синхронизация прервана из-за таймаута внешнего сервиса")
+        raise external_service_error(
+            exc,
+            code="SYNC_FAILED",
+            message="Внешний сервис не ответил вовремя",
+        ) from exc
+    except GoogleHttpError as exc:
+        if session is not None:
+            session.rollback()
+        update_status("❌ Синхронизация прервана из-за ошибки внешнего сервиса")
+        raise external_service_error(
+            exc,
+            code="SYNC_FAILED",
+            message="Не удалось получить данные из внешнего сервиса",
+        ) from exc
+    except Exception as exc:
+        if session is not None:
+            session.rollback()
+        update_status("❌ Синхронизация прервана из-за внутренней ошибки")
+        raise ApiError(
+            500,
+            "SYNC_FAILED",
+            "Не удалось выполнить синхронизацию",
+        ) from exc
     finally:
-        session.close()
+        if session is not None:
+            session.close()
+        if not lock_handed_off:
+            _sync_lock.release()
 
 
-@app.post("/update-cv-texts")
+@app.post("/update-cv-texts", responses=ERROR_RESPONSES)
 async def update_cv_texts(days_limit: int = Query(None)):
     return await internal_update_cv_texts(days_limit=days_limit)
 
 
-@app.post("/parse-cv-stacks")
+@app.post("/parse-cv-stacks", responses=ERROR_RESPONSES)
 def parse_cv_stacks(
     days_limit: int = Query(None, description="Лимит дней для парсинга (None = все)")
 ):
     return internal_parse_cv_stacks(days_limit=days_limit)
 
 
-@app.post("/build-embeddings")
+@app.post("/build-embeddings", responses=ERROR_RESPONSES)
 def build_embeddings(
     days_limit: int = Query(
         None, description="Лимит дней для генерации эмбеддингов (None = все)"
@@ -398,19 +462,27 @@ def build_embeddings(
     return internal_build_embeddings(days_limit=days_limit)
 
 
-@app.post("/fuzzy-match")
+@app.post("/fuzzy-match", responses=ERROR_RESPONSES)
 def fuzzy_match(request: FuzzyMatchRequest):
-    return fuzzy_search_candidates(
-        keywords=request.keywords,
-        target_client=request.target_client,
-        target_broker=request.target_broker,
-        threshold=request.threshold,
-        departments=request.departments,
-    )
+    if not any(keyword.strip() for keyword in request.keywords):
+        raise ApiError(400, "INVALID_SEARCH_QUERY", "Укажите ключевые слова для поиска")
+    try:
+        return fuzzy_search_candidates(
+            keywords=request.keywords,
+            target_client=request.target_client,
+            target_broker=request.target_broker,
+            threshold=request.threshold,
+            departments=request.departments,
+        )
+    except Exception as exc:
+        raise ApiError(500, "SEARCH_FAILED", "Не удалось выполнить нечёткий поиск") from exc
 
 
-@app.post("/semantic-match")
+@app.post("/semantic-match", responses=ERROR_RESPONSES)
 def semantic_match(request: SemanticMatchRequest):
+    if not request.query.strip():
+        raise ApiError(400, "INVALID_SEARCH_QUERY", "Поисковый запрос не может быть пустым")
+
     session = SessionLocal()
     try:
         ai_query = request.query
@@ -481,12 +553,19 @@ def semantic_match(request: SemanticMatchRequest):
             )
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(500, "SEARCH_FAILED", "Не удалось выполнить семантический поиск") from exc
     finally:
         session.close()
 
 
-@app.get("/search")
-def search(query: str = Query(..., min_length=1)):
+@app.get("/search", responses=ERROR_RESPONSES)
+def search(query: str = Query(..., min_length=1, max_length=5000)):
+    if not query.strip():
+        raise ApiError(400, "INVALID_SEARCH_QUERY", "Поисковый запрос не может быть пустым")
+
     session = SessionLocal()
     try:
         candidates = session.query(Candidate).all()
@@ -506,19 +585,28 @@ def search(query: str = Query(..., min_length=1)):
                 )
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
+    except Exception as exc:
+        raise ApiError(500, "SEARCH_FAILED", "Не удалось выполнить поиск") from exc
     finally:
         session.close()
 
 
-@app.get("/sync-status")
+@app.get("/sync-status", responses=ERROR_RESPONSES)
 def get_sync_status():
-    if os.path.exists("sync_status.txt"):
-        with open("sync_status.txt", "r", encoding="utf-8") as f:
-            return {"status": f.read()}
-    return {"status": "Синхронизация еще не запускалась"}
+    try:
+        if os.path.exists("sync_status.txt"):
+            with open("sync_status.txt", "r", encoding="utf-8") as f:
+                return {"status": f.read()}
+        return {"status": "Синхронизация еще не запускалась"}
+    except OSError as exc:
+        raise ApiError(
+            500,
+            "SYNC_STATUS_FAILED",
+            "Не удалось получить статус синхронизации",
+        ) from exc
 
 
-@app.post("/analyze-cv")
+@app.post("/analyze-cv", responses=ERROR_RESPONSES)
 def analyze_cv(request: AnalyzeRequest):
     from services.embeddings import model, cosine_similarity, embed
 
@@ -530,7 +618,11 @@ def analyze_cv(request: AnalyzeRequest):
             .first()
         )
         if not cand or not cand.cv_text:
-            return {"error": "Кандидат не найден или нет текста резюме"}
+            raise ApiError(
+                404,
+                "CANDIDATE_NOT_FOUND",
+                "Кандидат не найден или текст резюме отсутствует",
+            )
 
         cand_stack = cand.stack or "Стек не распарсился"
         kw_pattern = re.compile(r"[a-zA-Z0-9+#\.\-_/]+")
@@ -544,7 +636,11 @@ def analyze_cv(request: AnalyzeRequest):
         raw_cv_blocks = re.split(r"\n|(?<=[.!?])\s+", cand.cv_text)
         cv_blocks = [b.strip() for b in raw_cv_blocks if len(b.strip()) > 40]
         if not cv_blocks:
-            return {"error": "Текст резюме слишком короткий или не читается"}
+            raise ApiError(
+                422,
+                "CV_TEXT_UNPROCESSABLE",
+                "Текст резюме слишком короткий или не читается",
+            )
 
         cv_vecs = model.encode(cv_blocks).tolist()
         req_lines = [
@@ -582,26 +678,50 @@ def analyze_cv(request: AnalyzeRequest):
             "candidate_stack": cand_stack,
             "matches": matches,
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(
+            500,
+            "ANALYSIS_FAILED",
+            "Не удалось выполнить анализ резюме",
+        ) from exc
     finally:
         session.close()
 
 
-@app.post("/sync-vacancies")
+@app.post("/sync-vacancies", responses=ERROR_RESPONSES)
 def sync_vacancies(backfill: bool = Query(False)):
     session = SessionLocal()
     try:
         stats = sync_vacancies_from_cloud(session, backfill=backfill)
         return {"status": "success", "stats": stats}
-    except Exception as e:
+    except (TimeoutError, asyncio.TimeoutError, requests.Timeout) as exc:
         session.rollback()
-        return {"status": "error", "message": str(e)}
+        raise external_service_error(
+            exc,
+            code="VACANCY_SYNC_FAILED",
+            message="Внешний сервис не ответил вовремя",
+        ) from exc
+    except GoogleHttpError as exc:
+        session.rollback()
+        raise external_service_error(
+            exc,
+            code="VACANCY_SYNC_FAILED",
+            message="Не удалось получить вакансии из внешнего сервиса",
+        ) from exc
+    except Exception as exc:
+        session.rollback()
+        raise ApiError(
+            500,
+            "VACANCY_SYNC_FAILED",
+            "Не удалось выполнить синхронизацию вакансий",
+        ) from exc
     finally:
         session.close()
 
 
-@app.get("/vacancies")
+@app.get("/vacancies", responses=ERROR_RESPONSES)
 def get_vacancies(
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
@@ -639,7 +759,7 @@ def get_vacancies(
         session.close()
 
 
-@app.get("/vacancy-departments")
+@app.get("/vacancy-departments", responses=ERROR_RESPONSES)
 def get_vacancy_departments():
     session = SessionLocal()
     try:
@@ -654,7 +774,7 @@ def get_vacancy_departments():
         session.close()
 
 
-@app.get("/departments")
+@app.get("/departments", responses=ERROR_RESPONSES)
 def get_departments():
     session = SessionLocal()
     try:
@@ -670,16 +790,34 @@ def get_departments():
         session.close()
 
 
-@app.post("/parse-tg")
+@app.post("/parse-tg", responses=ERROR_RESPONSES)
 def parse_tg_endpoint(req: TGRequest):
     try:
         posts = fetch_tg_channel_posts(req.url, req.limit)
         return {"status": "success", "posts": posts}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+    except ValueError as exc:
+        raise ApiError(400, "INVALID_TELEGRAM_URL", str(exc)) from exc
+    except (TimeoutError, requests.Timeout) as exc:
+        raise external_service_error(
+            exc,
+            code="TELEGRAM_FETCH_FAILED",
+            message="Telegram не ответил вовремя",
+        ) from exc
+    except requests.RequestException as exc:
+        raise external_service_error(
+            exc,
+            code="TELEGRAM_FETCH_FAILED",
+            message="Не удалось получить данные из Telegram",
+        ) from exc
+    except Exception as exc:
+        raise ApiError(
+            500,
+            "TELEGRAM_FETCH_FAILED",
+            "Не удалось обработать Telegram-канал",
+        ) from exc
 
 
-@app.post("/save-tg-vacancy")
+@app.post("/save-tg-vacancy", responses=ERROR_RESPONSES)
 def save_tg_vacancy(req: TGSaveRequest):
     session = SessionLocal()
     try:
@@ -696,14 +834,18 @@ def save_tg_vacancy(req: TGSaveRequest):
         session.add(new_vac)
         session.commit()
         return {"status": "success"}
-    except Exception as e:
+    except Exception as exc:
         session.rollback()
-        return {"status": "error", "detail": str(e)}
+        raise ApiError(
+            500,
+            "TELEGRAM_VACANCY_SAVE_FAILED",
+            "Не удалось сохранить вакансию",
+        ) from exc
     finally:
         session.close()
 
 
-@app.get("/saved-tg-vacancies")
+@app.get("/saved-tg-vacancies", responses=ERROR_RESPONSES)
 def get_saved_tg_vacancies(
     page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)
 ):
@@ -725,7 +867,11 @@ def get_saved_tg_vacancies(
                 {"id": v.id, "channel": v.channel, "text": v.raw_text} for v in rows
             ],
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as exc:
+        raise ApiError(
+            500,
+            "TELEGRAM_VACANCIES_FETCH_FAILED",
+            "Не удалось получить сохранённые вакансии",
+        ) from exc
     finally:
         session.close()
