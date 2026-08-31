@@ -3,11 +3,11 @@ import os
 import re
 import requests
 import streamlit as st
-import time
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 _KW_RE = re.compile(r"[a-zA-Zа-яА-Я0-9\.+#][a-zA-Zа-яА-Я0-9+#\.\-_/]*")
+
 
 def _api_get(
     path: str, params: dict | None = None, timeout_s: int = 20
@@ -21,9 +21,55 @@ def _api_post(
     return requests.post(f"{API_BASE}{path}", json=payload, timeout=timeout_s)
 
 
+def _get_sync_status() -> tuple[str | None, str | None]:
+    """Return the current backend sync status or a user-facing error."""
+    try:
+        response = _api_get("/sync-status")
+        if not response.ok:
+            return None, f"Сервер вернул ошибку {response.status_code}."
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None, "Сервер вернул некорректный статус синхронизации."
+
+        status = str(payload.get("status", "")).strip()
+        if not status:
+            return None, "Сервер вернул пустой статус синхронизации."
+
+        return status, None
+    except (requests.RequestException, ValueError) as exc:
+        return None, f"Не удалось получить статус с сервера: {exc}"
+
+
+def _classify_sync_status(status: str) -> str:
+    """Map the existing text-only backend status to a UI state."""
+    normalized = status.lower().replace("ё", "е")
+
+    if "еще не запускалась" in normalized:
+        return "idle"
+    if "ошибка" in normalized or "прерван" in normalized:
+        return "failed"
+    if "завершена" in normalized:
+        return "completed"
+    return "running"
+
+
+def _render_sync_status(status: str) -> None:
+    state = _classify_sync_status(status)
+
+    if state == "idle":
+        st.caption(status)
+    elif state == "completed":
+        st.success(status)
+    elif state == "failed":
+        st.error(status)
+    else:
+        st.info(f"**В процессе:** {status}")
+
+
 def _extract_keywords(query: str) -> list[str]:
     q = (query or "").lower()
-    kws = [k for k in _KW_RE.findall(q) if len(k) >= 2]
+    kws = [k for k in _KW_RE.findall(q) if len(k) >= 1]
     return list(dict.fromkeys(kws))[:30]
 
 
@@ -101,13 +147,15 @@ def _render_search_results(
             if cv_url:
                 st.caption(f"Постоянная ссылка: {cv_url}")
 
+
 def _reset_search_results():
     st.session_state.search_results = None
 
 
 st.set_page_config(page_title="CV Matching UI", layout="wide")
 
-st.markdown("""
+st.markdown(
+    """
     <style>
         header[data-testid="stHeader"] {
             position: static !important;
@@ -132,57 +180,55 @@ st.markdown("""
             min-width: 0 !important;
         }
     </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+
+_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment")
+
+
+@_fragment(run_every="3s")
+def _render_sync_controls():
+    current_status, status_error = _get_sync_status()
+    sync_is_running = (
+        current_status is not None
+        and _classify_sync_status(current_status) == "running"
+    )
+
+    sync_requested = st.button(
+        "Синхронизация",
+        use_container_width=True,
+        type="primary",
+        disabled=sync_is_running,
+    )
+
+    if sync_requested:
+        with st.spinner("Отправка команды на сервер..."):
+            try:
+                response = _api_post("/sync-excel")
+                if response.ok:
+                    data = response.json()
+                    if isinstance(data, dict) and data.get("status") == "success":
+                        st.success(f"**{data.get('message')}**")
+                        return
+                    message = data.get("message") if isinstance(data, dict) else None
+                    st.error(f"Ошибка бэкенда: {message or 'некорректный ответ'}")
+                else:
+                    st.error(f"Ошибка сервера: {response.status_code}")
+            except (requests.RequestException, ValueError) as exc:
+                st.error(f"Ошибка подключения к API: {exc}")
+        return
+
+    if status_error:
+        st.warning(status_error)
+    elif current_status is not None:
+        _render_sync_status(current_status)
+
 
 with st.sidebar:
     st.header("Синхронизация данных")
-
-    if st.button("Синхронизация", use_container_width=True, type="primary"):
-        with st.spinner("Отправка команды на сервер..."):
-            try:
-                res = _api_post("/sync-excel")
-                if res.ok:
-                    data = res.json()
-                    if data.get("status") == "success":
-                        st.success(f"**{data.get('message')}**")
-
-                        status_placeholder = st.empty()
-
-                        while True:
-                            status_res = _api_get("/sync-status")
-                            if status_res.ok:
-                                current_status = status_res.json().get("status", "")
-                                status_placeholder.info(
-                                    f"**В процессе:** {current_status}"
-                                )
-
-                                current_status_lower = current_status.lower()
-                                if (
-                                    "завершена" in current_status_lower
-                                    or "прерван" in current_status_lower
-                                    or "ошибка" in current_status_lower
-                                ):
-                                    if "завершена" in current_status_lower:
-                                        status_placeholder.success(
-                                            f"✅ {current_status}"
-                                        )
-                                    else:
-                                        status_placeholder.error(f"❌ {current_status}")
-                                    break
-                            else:
-                                status_placeholder.warning(
-                                    "Не удалось получить статус с сервера..."
-                                )
-                                break
-
-                            time.sleep(3)
-
-                    else:
-                        st.error(f"Ошибка бэкенда: {data.get('message')}")
-                else:
-                    st.error(f"Ошибка сервера: {res.status_code}")
-            except Exception as e:
-                st.error(f"Ошибка подключения к API: {e}")
+    _render_sync_controls()
 
 st.title("CV Matching System")
 
@@ -193,7 +239,7 @@ query = st.text_area(
     value=st.session_state.get("saved_query", ""),
     placeholder="Например: python fastapi postgresql docker",
     height=100,
-    key="search_query_input"
+    key="search_query_input",
 )
 
 if "auto_search_query" in st.session_state:
@@ -201,17 +247,34 @@ if "auto_search_query" in st.session_state:
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    target_client = st.text_input("Конечный клиент", value="", key="target_client_input")
+    target_client = st.text_input(
+        "Конечный клиент", value="", key="target_client_input"
+    )
 with col2:
-    target_broker = st.text_input("Брокер / Посредник", value="", key="target_broker_input")
+    target_broker = st.text_input(
+        "Брокер / Посредник", value="", key="target_broker_input"
+    )
 with col3:
     try:
         dep_res = _api_get("/departments", timeout_s=5)
-        available_departments = dep_res.json() if dep_res.ok else []
-    except:
+        raw_depts = dep_res.json() if dep_res.ok else []
+
+        cleaned_depts = set()
+        for department in raw_depts:
+            if department:
+                normalized = department.replace("C", "С").replace("c", "с").strip()
+                cleaned_depts.add(normalized)
+
+        available_departments = sorted(cleaned_depts)
+    except Exception:
         available_departments = []
-        
-selected_depts = st.multiselect("Отделы", options=available_departments, key="selected_depts_input")
+
+selected_depts = st.multiselect(
+    "Отделы",
+    options=available_departments,
+    key="selected_depts_input",
+    placeholder="Выберите отдел",
+)
 
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
 semantic_enabled = st.checkbox(
@@ -310,4 +373,4 @@ if st.session_state.search_results is not None:
     if limit < len(st.session_state.search_results):
         if st.button("Показать еще 50"):
             st.session_state.display_limit += 50
-            st.rerun() 
+            st.rerun()
