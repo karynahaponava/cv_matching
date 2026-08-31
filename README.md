@@ -41,6 +41,70 @@ sudo docker compose up --build
 _(база данных, таблицы и все сервисы поднимутся автоматически)_
 Сайт откроется на `http://localhost:8501`, API — на `http://localhost:8000`.
 
+## API
+
+После запуска интерактивная документация доступна по адресам:
+
+- Swagger UI: `http://localhost:8000/docs`
+- OpenAPI schema: `http://localhost:8000/openapi.json`
+
+### Формат ошибок
+
+Все API endpoints возвращают ошибки в едином JSON-формате:
+
+```json
+{
+  "code": "SYNC_FAILED",
+  "message": "Не удалось выполнить синхронизацию",
+  "details": null,
+  "trace_id": "3997809c-45ff-4d7e-8071-5f45d49a9678"
+}
+```
+
+Поля ответа:
+
+| Поле | Тип | Описание |
+| --- | --- | --- |
+| `code` | `string` | Стабильный машинный код ошибки для клиентской логики |
+| `message` | `string` | Безопасное человекочитаемое описание ошибки |
+| `details` | `object`, `array` или `null` | Дополнительные данные, например список ошибок валидации |
+| `trace_id` | `string` | Идентификатор запроса для поиска события в серверных логах |
+
+`trace_id` также возвращается в HTTP-заголовке `X-Trace-ID`. Внутренние исключения и чувствительные данные не включаются в публичный ответ.
+
+### HTTP-коды ошибок
+
+| HTTP-код | Когда возвращается | Примеры `code` |
+| --- | --- | --- |
+| `400 Bad Request` | Запрос формально корректен, но содержит пустое или недопустимое значение | `INVALID_REQUEST`, `INVALID_SEARCH_QUERY` |
+| `404 Not Found` | Кандидат, endpoint или другой ресурс не найден | `CANDIDATE_NOT_FOUND`, `RESOURCE_NOT_FOUND` |
+| `409 Conflict` | Операция конфликтует с текущим состоянием | `SYNC_IN_PROGRESS` |
+| `422 Unprocessable Entity` | Тело запроса или query-параметры не прошли валидацию | `VALIDATION_ERROR`, `CV_TEXT_UNPROCESSABLE` |
+| `429 Too Many Requests` | Внутренний или внешний сервис ограничил частоту запросов | `RATE_LIMIT_EXCEEDED` |
+| `500 Internal Server Error` | Непредвиденная внутренняя ошибка приложения | `INTERNAL_ERROR`, `SEARCH_FAILED`, `SYNC_FAILED` |
+| `502 Bad Gateway` | Внешний сервис вернул ошибку или соединение с ним не установлено | `SYNC_FAILED`, `VACANCY_SYNC_FAILED` |
+| `504 Gateway Timeout` | Внешний сервис не ответил за отведённое время | `SYNC_FAILED`, `VACANCY_SYNC_FAILED` |
+
+Пример ошибки валидации:
+
+```json
+{
+  "code": "VALIDATION_ERROR",
+  "message": "Запрос не прошёл валидацию",
+  "details": [
+    {
+      "type": "missing",
+      "loc": ["body", "query"],
+      "msg": "Field required",
+      "input": {}
+    }
+  ],
+  "trace_id": "3a7778dc-fb95-4fb6-afcb-49bf1dfcd257"
+}
+```
+
+Пустой результат поиска не является ошибкой и возвращается как `200 OK` с пустым массивом `[]`.
+
 ## DevOps Roadmap
 
 По документу DevOps-часть пока довольно базовая: проект фактически находится на уровне локального прототипа. Стек приложения — **FastAPI + Streamlit + PostgreSQL + Sentence-Transformers + Google APIs**.
