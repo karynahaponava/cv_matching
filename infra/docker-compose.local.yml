@@ -1,0 +1,84 @@
+name: cv-matching-local
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: cv_matching
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data_local:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cv_matching"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.local
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/cv_matching
+      GOOGLE_CREDS_PATH: /app/google_creds.json
+      SPREADSHEET_URL: ${SPREADSHEET_URL:-}
+      TG_CHANNELS: ${TG_CHANNELS:-}
+      WATCHFILES_FORCE_POLLING: "true"
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ../backend:/app
+      - ../google_creds.json:/app/google_creds.json:ro
+      - huggingface_cache:/root/.cache/huggingface
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    environment:
+      API_BASE_URL: http://backend:8000
+      TG_CHANNELS: ${TG_CHANNELS:-}
+    command:
+      [
+        "python",
+        "-m",
+        "streamlit",
+        "run",
+        "ui.py",
+        "--server.address",
+        "0.0.0.0",
+        "--server.port",
+        "8501",
+        "--server.runOnSave",
+        "true",
+      ]
+    ports:
+      - "${FRONTEND_PORT:-8501}:8501"
+    volumes:
+      - ../frontend:/app
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pg_data_local:
+  huggingface_cache:
