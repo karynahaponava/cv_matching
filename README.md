@@ -41,6 +41,49 @@ sudo docker compose up --build
 _(база данных, таблицы и все сервисы поднимутся автоматически)_
 Сайт откроется на `http://localhost:8501`, API — на `http://localhost:8000`.
 
+### Локальная разработка
+
+Для локальной разработки используйте отдельный Compose без nginx, TLS и certbot:
+
+```bash
+cd infra
+docker compose -f docker-compose.local.yml up --build
+```
+
+Local Compose запускает:
+
+- PostgreSQL на `localhost:5432`;
+- FastAPI с hot reload на `http://localhost:8000`;
+- Streamlit с автоматическим обновлением на `http://localhost:8501`;
+- Swagger UI на `http://localhost:8000/docs`.
+
+По умолчанию локальный пароль PostgreSQL — `postgres`. Его и публикуемые порты можно переопределить в `infra/.env`:
+
+```env
+POSTGRES_PASSWORD=local-secret
+POSTGRES_PORT=5432
+BACKEND_PORT=8000
+FRONTEND_PORT=8501
+SPREADSHEET_URL=https://docs.google.com/spreadsheets/d/...
+TG_CHANNELS=https://t.me/channel_1,https://t.me/channel_2
+```
+
+Backend local-образ использует CPU-only PyTorch и не скачивает NVIDIA/CUDA-пакеты. Исходники backend и frontend подключены как volumes, поэтому после первой сборки изменения Python-файлов не требуют пересборки образов. Модель Sentence Transformers сохраняется в отдельном Docker volume `huggingface_cache`.
+
+Остановить окружение:
+
+```bash
+docker compose -f docker-compose.local.yml down
+```
+
+Удалить также локальную БД и кэш модели:
+
+```bash
+docker compose -f docker-compose.local.yml down --volumes
+```
+
+Последняя команда необратимо удаляет данные локальной PostgreSQL.
+
 ## API
 
 После запуска интерактивная документация доступна по адресам:
