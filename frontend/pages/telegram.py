@@ -2,6 +2,7 @@ import os
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from api_client import api_error_message
 
 load_dotenv()
 
@@ -59,7 +60,7 @@ with st.container(border=True):
                         else:
                             st.error(f"Ошибка парсера: {data.get('detail')}")
                     else:
-                        st.error(f"Ошибка сервера: {res.status_code}")
+                        st.error(api_error_message(res, "Ошибка парсера Telegram"))
                 except Exception as e:
                     st.error(f"Ошибка подключения: {e}")
 
@@ -80,10 +81,19 @@ if st.session_state.tg_posts:
                                 f"{API_BASE}/save-tg-vacancy",
                                 json={"channel": post['channel'], "text": post['text']}
                             )
-                            if save_res.ok and save_res.json().get("status") == "success":
-                                st.success("Успешно сохранено!")
+                            if save_res.ok:
+                                save_data = save_res.json()
+                                if save_data.get("status") == "success":
+                                    st.success("Успешно сохранено!")
+                                else:
+                                    st.info("Уже есть в базе.")
                             else:
-                                st.info("Уже есть в базе.")
+                                st.error(
+                                    api_error_message(
+                                        save_res,
+                                        "Не удалось сохранить вакансию",
+                                    )
+                                )
                         except Exception as e:
                             st.error(f"Ошибка: {e}")
                             

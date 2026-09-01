@@ -2,6 +2,7 @@ import os
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from api_client import api_error_message
 
 load_dotenv()
 
@@ -30,7 +31,8 @@ def fetch_vacancies_from_db(page: int, size: int):
         params={"page": page, "page_size": size},
         timeout=10
     )
-    res.raise_for_status()
+    if not res.ok:
+        raise RuntimeError(api_error_message(res, "Не удалось загрузить вакансии"))
     return res.json()
 
 with st.spinner("Загрузка данных из БД..."):

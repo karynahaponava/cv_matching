@@ -3,6 +3,7 @@ import os
 import re
 import requests
 import streamlit as st
+from api_client import api_error_message
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
@@ -26,7 +27,10 @@ def _get_sync_status() -> tuple[str | None, str | None]:
     try:
         response = _api_get("/sync-status")
         if not response.ok:
-            return None, f"Сервер вернул ошибку {response.status_code}."
+            return None, api_error_message(
+                response,
+                "Не удалось получить статус синхронизации",
+            )
 
         payload = response.json()
         if not isinstance(payload, dict):
@@ -215,7 +219,9 @@ def _render_sync_controls():
                     message = data.get("message") if isinstance(data, dict) else None
                     st.error(f"Ошибка бэкенда: {message or 'некорректный ответ'}")
                 else:
-                    st.error(f"Ошибка сервера: {response.status_code}")
+                    st.error(
+                        api_error_message(response, "Не удалось запустить синхронизацию")
+                    )
             except (requests.RequestException, ValueError) as exc:
                 st.error(f"Ошибка подключения к API: {exc}")
         return
@@ -314,7 +320,9 @@ if st.button("Начать поиск", type="primary"):
                         st.session_state.last_query = q
                         st.session_state.is_fuzzy = False
                     else:
-                        st.error(f"Ошибка семантического поиска: {resp.status_code}")
+                        st.error(
+                            api_error_message(resp, "Ошибка семантического поиска")
+                        )
                         st.session_state.search_results = None
 
                 elif fuzzy_enabled:
@@ -337,7 +345,7 @@ if st.button("Начать поиск", type="primary"):
                             st.session_state.last_query = q
                             st.session_state.is_fuzzy = True
                         else:
-                            st.error(f"Ошибка нечёткого поиска: {resp.status_code}")
+                            st.error(api_error_message(resp, "Ошибка нечёткого поиска"))
                             st.session_state.search_results = None
 
                 else:
@@ -347,7 +355,7 @@ if st.button("Начать поиск", type="primary"):
                         st.session_state.last_query = q
                         st.session_state.is_fuzzy = False
                     else:
-                        st.error(f"Ошибка классического поиска: {resp.status_code}")
+                        st.error(api_error_message(resp, "Ошибка классического поиска"))
                         st.session_state.search_results = None
             except Exception as e:
                 st.error(f"Не удалось связаться с сервером API: {e}")

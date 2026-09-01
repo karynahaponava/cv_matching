@@ -1,6 +1,7 @@
 import os
 import requests
 import streamlit as st
+from api_client import api_error_message
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 PAGE_SIZE = 25
@@ -38,7 +39,7 @@ with st.sidebar:
                     else:
                         st.error(f"Ошибка: {data.get('message')}")
                 else:
-                    st.error(f"Ошибка сервера: {res.status_code}")
+                    st.error(api_error_message(res, "Ошибка синхронизации вакансий"))
             except Exception as e:
                 st.error(f"Ошибка подключения к API: {e}")
 
@@ -70,7 +71,7 @@ if st.session_state.get("vac_dept_filter") and st.session_state.vac_dept_filter 
 try:
     res = _api_get("/vacancies", params=params)
     if not res.ok:
-        st.error(f"Ошибка сервера: {res.status_code}")
+        st.error(api_error_message(res, "Не удалось загрузить вакансии"))
         st.stop()
     data = res.json()
 except Exception as e:
