@@ -46,6 +46,9 @@ from api_errors import (
 _sync_lock = threading.Lock()
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
+INTERRUPTED_SYNC_STATUS = (
+    "❌ Предыдущая синхронизация прервана перезапуском сервиса."
+)
 
 
 class PaginationRequest(BaseModel):
@@ -166,6 +169,37 @@ def update_status(text: str):
     """Helper function for writing the current status to a file"""
     with open("sync_status.txt", "w", encoding="utf-8") as f:
         f.write(text)
+
+
+def _status_looks_running(status: str) -> bool:
+    normalized = status.strip().lower().replace("ё", "е")
+    if not normalized:
+        return False
+    terminal_markers = (
+        "завершена",
+        "прерван",
+        "ошибка",
+        "еще не запускалась",
+        "не выполняется",
+    )
+    return not any(marker in normalized for marker in terminal_markers)
+
+
+def recover_stale_sync_status() -> str | None:
+    """Mark a persisted in-progress status as interrupted after process restart."""
+    if _sync_lock.locked() or not os.path.exists("sync_status.txt"):
+        return None
+
+    try:
+        with open("sync_status.txt", "r", encoding="utf-8") as status_file:
+            status = status_file.read()
+        if _status_looks_running(status):
+            update_status(INTERRUPTED_SYNC_STATUS)
+            return INTERRUPTED_SYNC_STATUS
+        return status
+    except OSError as exc:
+        print(f"[Статус синхронизации] Не удалось восстановить статус: {exc}")
+        return None
 
 
 async def internal_update_cv_texts(days_limit: int = None):
@@ -441,6 +475,7 @@ def scheduled_tg_parsing_job():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    recover_stale_sync_status()
     Base.metadata.create_all(bind=engine)
     scheduler = BackgroundScheduler()
     scheduler.add_job(
@@ -713,6 +748,9 @@ def search(
 @app.get("/sync-status", responses=ERROR_RESPONSES)
 def get_sync_status():
     try:
+        recovered_status = recover_stale_sync_status()
+        if recovered_status is not None:
+            return {"status": recovered_status}
         if os.path.exists("sync_status.txt"):
             with open("sync_status.txt", "r", encoding="utf-8") as f:
                 return {"status": f.read()}

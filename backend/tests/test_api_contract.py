@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 from fastapi import BackgroundTasks
@@ -231,3 +232,45 @@ def test_maintenance_lock_released_when_session_creation_fails(monkeypatch, oper
     with pytest.raises(ApiError):
         operation()
     assert not main._sync_lock.locked()
+
+
+def test_stale_running_sync_status_is_marked_interrupted(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    status_file = Path("sync_status.txt")
+    status_file.write_text(
+        "Шаг 2: Скачивание текстов резюме для ВСЕЙ базы...",
+        encoding="utf-8",
+    )
+
+    response = main.get_sync_status()
+
+    assert response == {"status": main.INTERRUPTED_SYNC_STATUS}
+    assert status_file.read_text(encoding="utf-8") == main.INTERRUPTED_SYNC_STATUS
+
+
+def test_active_sync_status_is_not_recovered(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    status_file = Path("sync_status.txt")
+    running_status = "Шаг 3: Анализ стека..."
+    status_file.write_text(running_status, encoding="utf-8")
+    main._sync_lock.acquire()
+
+    assert main.recover_stale_sync_status() is None
+    assert status_file.read_text(encoding="utf-8") == running_status
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        "🎉 Синхронизация полностью завершена!",
+        "❌ Процесс прерван из-за ошибки",
+        "Синхронизация еще не запускалась",
+    ],
+)
+def test_terminal_sync_status_is_preserved(monkeypatch, tmp_path, terminal_status):
+    monkeypatch.chdir(tmp_path)
+    status_file = Path("sync_status.txt")
+    status_file.write_text(terminal_status, encoding="utf-8")
+
+    assert main.recover_stale_sync_status() == terminal_status
+    assert status_file.read_text(encoding="utf-8") == terminal_status
