@@ -154,6 +154,50 @@ def _render_search_results(
 
 def _reset_search_results():
     st.session_state.search_results = None
+    st.session_state.search_pagination = None
+    st.session_state.search_context = None
+
+
+def _fetch_search_page(context: dict, page: int) -> requests.Response:
+    common = {"page": page, "page_size": 50}
+    if context["mode"] == "semantic":
+        return _api_post(
+            "/semantic-match",
+            payload={
+                **common,
+                "query": context["query"],
+                "target_client": context["target_client"],
+                "target_broker": context["target_broker"],
+                "departments": context["departments"],
+            },
+        )
+    if context["mode"] == "fuzzy":
+        return _api_post(
+            "/fuzzy-match",
+            payload={
+                **common,
+                "keywords": context["keywords"],
+                "target_client": context["target_client"],
+                "target_broker": context["target_broker"],
+                "departments": context["departments"],
+            },
+        )
+    return _api_get(
+        "/search",
+        params={**common, "query": context["query"]},
+    )
+
+
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None
+if "search_pagination" not in st.session_state:
+    st.session_state.search_pagination = None
+if "search_context" not in st.session_state:
+    st.session_state.search_context = None
+if "last_query" not in st.session_state:
+    st.session_state.last_query = ""
+if "is_fuzzy" not in st.session_state:
+    st.session_state.is_fuzzy = False
 
 
 st.set_page_config(page_title="CV Matching UI", layout="wide")
@@ -246,6 +290,7 @@ query = st.text_area(
     placeholder="Например: python fastapi postgresql docker",
     height=100,
     key="search_query_input",
+    on_change=_reset_search_results,
 )
 
 if "auto_search_query" in st.session_state:
@@ -254,11 +299,17 @@ if "auto_search_query" in st.session_state:
 col1, col2, col3 = st.columns(3)
 with col1:
     target_client = st.text_input(
-        "Конечный клиент", value="", key="target_client_input"
+        "Конечный клиент",
+        value="",
+        key="target_client_input",
+        on_change=_reset_search_results,
     )
 with col2:
     target_broker = st.text_input(
-        "Брокер / Посредник", value="", key="target_broker_input"
+        "Брокер / Посредник",
+        value="",
+        key="target_broker_input",
+        on_change=_reset_search_results,
     )
 with col3:
     try:
@@ -280,105 +331,107 @@ selected_depts = st.multiselect(
     options=available_departments,
     key="selected_depts_input",
     placeholder="Выберите отдел",
+    on_change=_reset_search_results,
 )
 
-fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
+fuzzy_enabled = st.checkbox(
+    "Включить нечёткий поиск (поиск опечаток)",
+    value=False,
+    on_change=_reset_search_results,
+)
 semantic_enabled = st.checkbox(
-    "Включить семантический ИИ-поиск (искать по смыслу)", value=True
+    "Включить семантический ИИ-поиск (искать по смыслу)",
+    value=True,
+    on_change=_reset_search_results,
 )
-
-if "search_results" not in st.session_state:
-    st.session_state.search_results = None
-if "last_query" not in st.session_state:
-    st.session_state.last_query = ""
-if "is_fuzzy" not in st.session_state:
-    st.session_state.is_fuzzy = False
-if "display_limit" not in st.session_state:
-    st.session_state.display_limit = 50
 
 if st.button("Начать поиск", type="primary"):
     q = query.strip()
     if not q:
         st.warning("Пожалуйста, введите требования для поиска.")
-        st.session_state.search_results = None
+        _reset_search_results()
     else:
-        st.session_state.display_limit = 50
         with st.spinner("Ищу подходящих кандидатов..."):
             try:
                 if semantic_enabled:
-                    resp = _api_post(
-                        "/semantic-match",
-                        payload={
-                            "query": q,
-                            "target_client": target_client.strip(),
-                            "target_broker": target_broker.strip(),
-                            "departments": selected_depts,
-                        },
-                    )
-                    if resp.ok:
-                        st.session_state.search_results = resp.json()
-                        st.session_state.last_query = q
-                        st.session_state.is_fuzzy = False
-                    else:
-                        st.error(
-                            api_error_message(resp, "Ошибка семантического поиска")
-                        )
-                        st.session_state.search_results = None
-
+                    context = {
+                        "mode": "semantic",
+                        "query": q,
+                        "target_client": target_client.strip(),
+                        "target_broker": target_broker.strip(),
+                        "departments": list(selected_depts),
+                    }
                 elif fuzzy_enabled:
                     keywords = _extract_keywords(q)
                     if not keywords:
                         st.warning("Не удалось выделить ключевые слова.")
-                        st.session_state.search_results = None
-                    else:
-                        resp = _api_post(
-                            "/fuzzy-match",
-                            payload={
-                                "keywords": keywords,
-                                "target_client": target_client.strip(),
-                                "target_broker": target_broker.strip(),
-                                "departments": selected_depts,
-                            },
-                        )
-                        if resp.ok:
-                            st.session_state.search_results = resp.json()
-                            st.session_state.last_query = q
-                            st.session_state.is_fuzzy = True
-                        else:
-                            st.error(api_error_message(resp, "Ошибка нечёткого поиска"))
-                            st.session_state.search_results = None
-
+                        _reset_search_results()
+                        st.stop()
+                    context = {
+                        "mode": "fuzzy",
+                        "query": q,
+                        "keywords": keywords,
+                        "target_client": target_client.strip(),
+                        "target_broker": target_broker.strip(),
+                        "departments": list(selected_depts),
+                    }
                 else:
-                    resp = _api_get("/search", params={"query": q})
-                    if resp.ok:
-                        st.session_state.search_results = resp.json()
-                        st.session_state.last_query = q
-                        st.session_state.is_fuzzy = False
-                    else:
-                        st.error(api_error_message(resp, "Ошибка классического поиска"))
-                        st.session_state.search_results = None
+                    context = {
+                        "mode": "classic",
+                        "query": q,
+                        "target_client": target_client.strip(),
+                        "target_broker": target_broker.strip(),
+                        "departments": list(selected_depts),
+                    }
+
+                resp = _fetch_search_page(context, page=1)
+                if resp.ok:
+                    data = resp.json()
+                    st.session_state.search_results = data.get("items", [])
+                    st.session_state.search_pagination = data.get("pagination", {})
+                    st.session_state.search_context = context
+                    st.session_state.last_query = q
+                    st.session_state.is_fuzzy = context["mode"] == "fuzzy"
+                else:
+                    st.error(api_error_message(resp, "Ошибка поиска"))
+                    _reset_search_results()
             except Exception as e:
                 st.error(f"Не удалось связаться с сервером API: {e}")
-                st.session_state.search_results = None
+                _reset_search_results()
 
 if st.session_state.search_results is not None:
     st.write("---")
-    limit = st.session_state.display_limit
-    top_results = st.session_state.search_results[:limit]
+    pagination = st.session_state.search_pagination or {}
+    total = pagination.get("total", len(st.session_state.search_results))
 
     st.caption(
-        f"Показано: {len(top_results)} из {len(st.session_state.search_results)} найденных."
+        f"Показано: {len(st.session_state.search_results)} из {total} найденных."
     )
 
     _render_search_results(
-        top_results,
+        st.session_state.search_results,
         st.session_state.last_query,
-        target_client=target_client.strip(),
-        target_broker=target_broker.strip(),
+        target_client=(st.session_state.search_context or {}).get("target_client", ""),
+        target_broker=(st.session_state.search_context or {}).get("target_broker", ""),
         fuzzy=st.session_state.is_fuzzy,
     )
 
-    if limit < len(st.session_state.search_results):
+    current_page = pagination.get("page", 1)
+    total_pages = pagination.get("total_pages", 0)
+    if current_page < total_pages:
         if st.button("Показать еще 50"):
-            st.session_state.display_limit += 50
-            st.rerun()
+            with st.spinner("Загружаю следующую страницу..."):
+                try:
+                    resp = _fetch_search_page(
+                        st.session_state.search_context,
+                        page=current_page + 1,
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        st.session_state.search_results.extend(data.get("items", []))
+                        st.session_state.search_pagination = data.get("pagination", {})
+                        st.rerun()
+                    else:
+                        st.error(api_error_message(resp, "Ошибка поиска"))
+                except Exception as e:
+                    st.error(f"Не удалось связаться с сервером API: {e}")
