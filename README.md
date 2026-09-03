@@ -146,7 +146,30 @@ docker compose -f docker-compose.local.yml down --volumes
 }
 ```
 
-Пустой результат поиска не является ошибкой и возвращается как `200 OK` с пустым массивом `[]`.
+### Поиск и пагинация
+
+`/semantic-match`, `/fuzzy-match`, `/search`, `/vacancies` и
+`/saved-tg-vacancies` возвращают единый ответ:
+
+```json
+{
+  "items": [],
+  "pagination": {
+    "page": 1,
+    "page_size": 50,
+    "total": 0,
+    "total_pages": 0
+  }
+}
+```
+
+Размер страницы по умолчанию — 50, максимум — 100. Для POST-поисков `page` и
+`page_size` передаются в JSON body, для GET — в query string. `query` ограничен
+2000 символами, fuzzy-поиск принимает до 30 keywords длиной до 64 символов и
+до 10 отделов. Лимиты по IP: 30 fuzzy- и 10 semantic-запросов в минуту.
+
+Пустой результат поиска не является ошибкой и возвращается как `200 OK` с
+пустым `items` и `total_pages: 0`.
 
 ## DevOps Roadmap
 

@@ -39,9 +39,10 @@ with st.spinner("Загрузка данных из БД..."):
     try:
         data = fetch_vacancies_from_db(st.session_state.tg_db_page, PAGE_SIZE)
         
-        total_items = data.get("total", 0)
         items = data.get("items", [])
-        total_pages = max(1, (total_items + PAGE_SIZE - 1) // PAGE_SIZE)
+        pagination = data.get("pagination", {})
+        total_items = pagination.get("total", 0)
+        total_pages = max(1, pagination.get("total_pages", 0))
 
         if st.session_state.tg_db_page > total_pages:
             st.session_state.tg_db_page = total_pages

@@ -205,7 +205,7 @@ def _install_main_import_stubs() -> None:
     _module("services.cv_parser", extract_all_from_text=lambda text: {})
     _module(
         "services.fuzzy_search",
-        fuzzy_search_candidates=lambda **kwargs: [],
+        fuzzy_search_candidates=lambda **kwargs: ([], 0),
         get_candidate_badge=lambda *args: (None, None),
     )
     _module("services.matcher", calculate_match_score=lambda query, text: 0)

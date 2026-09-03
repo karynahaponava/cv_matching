@@ -1,5 +1,8 @@
 import re
+import math
 import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 import os
@@ -12,8 +15,8 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import requests
 import asyncio
 import numpy as np
-from fastapi import FastAPI, Query, BackgroundTasks
-from pydantic import BaseModel, Field
+from fastapi import BackgroundTasks, Depends, FastAPI, Query, Request
+from pydantic import BaseModel, Field, field_validator
 from apscheduler.schedulers.background import BackgroundScheduler
 from googleapiclient.errors import HttpError as GoogleHttpError
 from sqlalchemy import func, or_
@@ -41,6 +44,84 @@ from api_errors import (
 
 
 _sync_lock = threading.Lock()
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 100
+INTERRUPTED_SYNC_STATUS = (
+    "❌ Предыдущая синхронизация прервана перезапуском сервиса."
+)
+
+
+class PaginationRequest(BaseModel):
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
+
+
+class PaginationMeta(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+def paginated_response(items: list, page: int, page_size: int, total: int) -> dict:
+    return {
+        "items": items,
+        "pagination": PaginationMeta(
+            page=page,
+            page_size=page_size,
+            total=total,
+            total_pages=math.ceil(total / page_size) if total else 0,
+        ).model_dump(),
+    }
+
+
+class SlidingWindowRateLimiter:
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._requests = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def check(self, bucket: str, client_ip: str, limit: int, window_seconds: int = 60):
+        now = self._clock()
+        key = (bucket, client_ip)
+        with self._lock:
+            requests = self._requests[key]
+            cutoff = now - window_seconds
+            while requests and requests[0] <= cutoff:
+                requests.popleft()
+            if len(requests) >= limit:
+                retry_after = max(1, math.ceil(window_seconds - (now - requests[0])))
+                raise ApiError(
+                    429,
+                    "RATE_LIMIT_EXCEEDED",
+                    f"Превышен лимит запросов: не более {limit} в минуту",
+                    headers={"Retry-After": str(retry_after)},
+                )
+            requests.append(now)
+
+    def reset(self):
+        with self._lock:
+            self._requests.clear()
+
+
+rate_limiter = SlidingWindowRateLimiter()
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def enforce_fuzzy_rate_limit(request: Request):
+    rate_limiter.check("fuzzy", _client_ip(request), limit=30)
+
+
+def enforce_semantic_rate_limit(request: Request):
+    rate_limiter.check("semantic", _client_ip(request), limit=10)
+
+
+def acquire_sync_lock():
+    if not _sync_lock.acquire(blocking=False):
+        raise ApiError(409, "SYNC_IN_PROGRESS", "Синхронизация уже выполняется")
 
 
 class TGSaveRequest(BaseModel):
@@ -52,23 +133,30 @@ class ImportExcelRequest(BaseModel):
     filepath: str
 
 
-class FuzzyMatchRequest(BaseModel):
+class FuzzyMatchRequest(PaginationRequest):
     keywords: list[str] = Field(min_length=1, max_length=30)
     threshold: float = Field(default=0.1, ge=0, le=1)
     target_client: str = ""
     target_broker: str = ""
-    departments: list[str] = Field(default_factory=list)
+    departments: list[str] = Field(default_factory=list, max_length=10)
+
+    @field_validator("keywords")
+    @classmethod
+    def validate_keyword_lengths(cls, value):
+        if any(len(keyword) > 64 for keyword in value):
+            raise ValueError("каждый keyword должен содержать не более 64 символов")
+        return value
 
 
-class SemanticMatchRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=5000)
+class SemanticMatchRequest(PaginationRequest):
+    query: str = Field(min_length=1, max_length=2000)
     target_client: str = ""
     target_broker: str = ""
-    departments: list[str] = Field(default_factory=list)
+    departments: list[str] = Field(default_factory=list, max_length=10)
 
 
 class AnalyzeRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=2000)
     cv_url: str
 
 
@@ -81,6 +169,37 @@ def update_status(text: str):
     """Helper function for writing the current status to a file"""
     with open("sync_status.txt", "w", encoding="utf-8") as f:
         f.write(text)
+
+
+def _status_looks_running(status: str) -> bool:
+    normalized = status.strip().lower().replace("ё", "е")
+    if not normalized:
+        return False
+    terminal_markers = (
+        "завершена",
+        "прерван",
+        "ошибка",
+        "еще не запускалась",
+        "не выполняется",
+    )
+    return not any(marker in normalized for marker in terminal_markers)
+
+
+def recover_stale_sync_status() -> str | None:
+    """Mark a persisted in-progress status as interrupted after process restart."""
+    if _sync_lock.locked() or not os.path.exists("sync_status.txt"):
+        return None
+
+    try:
+        with open("sync_status.txt", "r", encoding="utf-8") as status_file:
+            status = status_file.read()
+        if _status_looks_running(status):
+            update_status(INTERRUPTED_SYNC_STATUS)
+            return INTERRUPTED_SYNC_STATUS
+        return status
+    except OSError as exc:
+        print(f"[Статус синхронизации] Не удалось восстановить статус: {exc}")
+        return None
 
 
 async def internal_update_cv_texts(days_limit: int = None):
@@ -235,7 +354,9 @@ async def process_manual_sync_in_background():
 def nightly_maintenance_job():
     """Automatic nightly build: Updates the structure COMPLETELY, but only parses the last 2 days"""
     if not _sync_lock.acquire(blocking=False):
-        print("[Ночная синхронизация] Пропущена: другая синхронизация уже выполняется")
+        message = "Ночная синхронизация пропущена: другая синхронизация уже выполняется"
+        print(f"[Ночная синхронизация] {message}")
+        update_status(message)
         return
 
     try:
@@ -354,6 +475,7 @@ def scheduled_tg_parsing_job():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    recover_stale_sync_status()
     Base.metadata.create_all(bind=engine)
     scheduler = BackgroundScheduler()
     scheduler.add_job(
@@ -383,12 +505,7 @@ def root():
 
 @app.post("/sync-excel", responses=ERROR_RESPONSES)
 def sync_excel(background_tasks: BackgroundTasks):
-    if not _sync_lock.acquire(blocking=False):
-        raise ApiError(
-            409,
-            "SYNC_IN_PROGRESS",
-            "Синхронизация уже выполняется",
-        )
+    acquire_sync_lock()
 
     session = None
     lock_handed_off = False
@@ -443,14 +560,22 @@ def sync_excel(background_tasks: BackgroundTasks):
 
 @app.post("/update-cv-texts", responses=ERROR_RESPONSES)
 async def update_cv_texts(days_limit: int = Query(None)):
-    return await internal_update_cv_texts(days_limit=days_limit)
+    acquire_sync_lock()
+    try:
+        return await internal_update_cv_texts(days_limit=days_limit)
+    finally:
+        _sync_lock.release()
 
 
 @app.post("/parse-cv-stacks", responses=ERROR_RESPONSES)
 def parse_cv_stacks(
     days_limit: int = Query(None, description="Лимит дней для парсинга (None = все)")
 ):
-    return internal_parse_cv_stacks(days_limit=days_limit)
+    acquire_sync_lock()
+    try:
+        return internal_parse_cv_stacks(days_limit=days_limit)
+    finally:
+        _sync_lock.release()
 
 
 @app.post("/build-embeddings", responses=ERROR_RESPONSES)
@@ -459,26 +584,43 @@ def build_embeddings(
         None, description="Лимит дней для генерации эмбеддингов (None = все)"
     )
 ):
-    return internal_build_embeddings(days_limit=days_limit)
+    acquire_sync_lock()
+    try:
+        return internal_build_embeddings(days_limit=days_limit)
+    finally:
+        _sync_lock.release()
 
 
-@app.post("/fuzzy-match", responses=ERROR_RESPONSES)
+@app.post(
+    "/fuzzy-match",
+    responses=ERROR_RESPONSES,
+    dependencies=[Depends(enforce_fuzzy_rate_limit)],
+)
 def fuzzy_match(request: FuzzyMatchRequest):
     if not any(keyword.strip() for keyword in request.keywords):
         raise ApiError(400, "INVALID_SEARCH_QUERY", "Укажите ключевые слова для поиска")
     try:
-        return fuzzy_search_candidates(
+        items, total = fuzzy_search_candidates(
             keywords=request.keywords,
             target_client=request.target_client,
             target_broker=request.target_broker,
             threshold=request.threshold,
             departments=request.departments,
+            page=request.page,
+            page_size=request.page_size,
         )
+        return paginated_response(items, request.page, request.page_size, total)
+    except ApiError:
+        raise
     except Exception as exc:
         raise ApiError(500, "SEARCH_FAILED", "Не удалось выполнить нечёткий поиск") from exc
 
 
-@app.post("/semantic-match", responses=ERROR_RESPONSES)
+@app.post(
+    "/semantic-match",
+    responses=ERROR_RESPONSES,
+    dependencies=[Depends(enforce_semantic_rate_limit)],
+)
 def semantic_match(request: SemanticMatchRequest):
     if not request.query.strip():
         raise ApiError(400, "INVALID_SEARCH_QUERY", "Поисковый запрос не может быть пустым")
@@ -512,8 +654,13 @@ def semantic_match(request: SemanticMatchRequest):
             if score >= 30.0:
                 matched_cands.append((c, score))
 
+        matched_cands.sort(key=lambda item: (-item[1], item[0].id))
+        total = len(matched_cands)
+        offset = (request.page - 1) * request.page_size
+        matched_cands = matched_cands[offset : offset + request.page_size]
+
         if not matched_cands:
-            return []
+            return paginated_response([], request.page, request.page_size, total)
 
         names = list(set([c.name for c, _ in matched_cands]))
         all_cands = (
@@ -551,8 +698,7 @@ def semantic_match(request: SemanticMatchRequest):
                     "badge_text": badge_text,
                 }
             )
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results
+        return paginated_response(results, request.page, request.page_size, total)
     except ApiError:
         raise
     except Exception as exc:
@@ -562,7 +708,11 @@ def semantic_match(request: SemanticMatchRequest):
 
 
 @app.get("/search", responses=ERROR_RESPONSES)
-def search(query: str = Query(..., min_length=1, max_length=5000)):
+def search(
+    query: str = Query(..., min_length=1, max_length=2000),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
     if not query.strip():
         raise ApiError(400, "INVALID_SEARCH_QUERY", "Поисковый запрос не может быть пустым")
 
@@ -583,8 +733,12 @@ def search(query: str = Query(..., min_length=1, max_length=5000)):
                         "score": score,
                     }
                 )
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results
+        results.sort(key=lambda item: (-item["score"], item["id"]))
+        total = len(results)
+        offset = (page - 1) * page_size
+        return paginated_response(
+            results[offset : offset + page_size], page, page_size, total
+        )
     except Exception as exc:
         raise ApiError(500, "SEARCH_FAILED", "Не удалось выполнить поиск") from exc
     finally:
@@ -594,6 +748,9 @@ def search(query: str = Query(..., min_length=1, max_length=5000)):
 @app.get("/sync-status", responses=ERROR_RESPONSES)
 def get_sync_status():
     try:
+        recovered_status = recover_stale_sync_status()
+        if recovered_status is not None:
+            return {"status": recovered_status}
         if os.path.exists("sync_status.txt"):
             with open("sync_status.txt", "r", encoding="utf-8") as f:
                 return {"status": f.read()}
@@ -692,39 +849,46 @@ def analyze_cv(request: AnalyzeRequest):
 
 @app.post("/sync-vacancies", responses=ERROR_RESPONSES)
 def sync_vacancies(backfill: bool = Query(False)):
-    session = SessionLocal()
+    acquire_sync_lock()
+    session = None
     try:
+        session = SessionLocal()
         stats = sync_vacancies_from_cloud(session, backfill=backfill)
         return {"status": "success", "stats": stats}
     except (TimeoutError, asyncio.TimeoutError, requests.Timeout) as exc:
-        session.rollback()
+        if session is not None:
+            session.rollback()
         raise external_service_error(
             exc,
             code="VACANCY_SYNC_FAILED",
             message="Внешний сервис не ответил вовремя",
         ) from exc
     except GoogleHttpError as exc:
-        session.rollback()
+        if session is not None:
+            session.rollback()
         raise external_service_error(
             exc,
             code="VACANCY_SYNC_FAILED",
             message="Не удалось получить вакансии из внешнего сервиса",
         ) from exc
     except Exception as exc:
-        session.rollback()
+        if session is not None:
+            session.rollback()
         raise ApiError(
             500,
             "VACANCY_SYNC_FAILED",
             "Не удалось выполнить синхронизацию вакансий",
         ) from exc
     finally:
-        session.close()
+        if session is not None:
+            session.close()
+        _sync_lock.release()
 
 
 @app.get("/vacancies", responses=ERROR_RESPONSES)
 def get_vacancies(
     page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=1, le=100),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     department: str = Query(None),
 ):
     session = SessionLocal()
@@ -734,16 +898,13 @@ def get_vacancies(
             query = query.filter(Vacancy.department == department)
         total = query.with_entities(func.count(Vacancy.id)).scalar()
         rows = (
-            query.order_by(Vacancy.created_at.desc())
+            query.order_by(Vacancy.created_at.desc(), Vacancy.id.desc())
             .offset((page - 1) * page_size)
             .limit(page_size)
             .all()
         )
-        return {
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "items": [
+        return paginated_response(
+            [
                 {
                     "id": v.id,
                     "thread_id": v.thread_id,
@@ -754,7 +915,10 @@ def get_vacancies(
                 }
                 for v in rows
             ],
-        }
+            page,
+            page_size,
+            total,
+        )
     finally:
         session.close()
 
@@ -847,7 +1011,8 @@ def save_tg_vacancy(req: TGSaveRequest):
 
 @app.get("/saved-tg-vacancies", responses=ERROR_RESPONSES)
 def get_saved_tg_vacancies(
-    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ):
     session = SessionLocal()
     try:
@@ -859,14 +1024,14 @@ def get_saved_tg_vacancies(
             .limit(page_size)
             .all()
         )
-        return {
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "items": [
+        return paginated_response(
+            [
                 {"id": v.id, "channel": v.channel, "text": v.raw_text} for v in rows
             ],
-        }
+            page,
+            page_size,
+            total,
+        )
     except Exception as exc:
         raise ApiError(
             500,

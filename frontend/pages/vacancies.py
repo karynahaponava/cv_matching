@@ -78,9 +78,10 @@ except Exception as e:
     st.error(f"Ошибка подключения к API: {e}")
     st.stop()
 
-total: int = data["total"]
 items: list = data["items"]
-total_pages = max(1, -(-total // PAGE_SIZE))
+pagination: dict = data["pagination"]
+total: int = pagination["total"]
+total_pages = max(1, pagination["total_pages"])
 
 st.caption(f"Всего запросов: **{total}** | Страница {st.session_state.vac_page} из {total_pages}")
 

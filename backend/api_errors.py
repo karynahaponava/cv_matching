@@ -29,12 +29,14 @@ class ApiError(Exception):
         code: str,
         message: str,
         details: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.details = details
+        self.headers = headers or {}
 
 
 ERROR_RESPONSES = {
@@ -60,6 +62,7 @@ def _error_response(
     code: str,
     message: str,
     details: Any | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     payload = ErrorResponse(
         code=code,
@@ -70,7 +73,7 @@ def _error_response(
     return JSONResponse(
         status_code=status_code,
         content=jsonable_encoder(payload),
-        headers={"X-Trace-ID": payload.trace_id},
+        headers={"X-Trace-ID": payload.trace_id, **(headers or {})},
     )
 
 
@@ -117,6 +120,7 @@ def install_error_handlers(app: FastAPI) -> None:
             code=exc.code,
             message=exc.message,
             details=exc.details,
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)

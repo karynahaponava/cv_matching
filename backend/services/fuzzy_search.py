@@ -145,7 +145,9 @@ def fuzzy_search_candidates(
     target_broker: str = None,
     threshold: float = 0.3,
     departments: list[str] | None = None,
-) -> list[dict]:
+    page: int = 1,
+    page_size: int = 50,
+) -> tuple[list[dict], int]:
     cleaned = [k.strip().lower() for k in keywords if k and k.strip()]
 
     cleaned_departments = [
@@ -155,9 +157,9 @@ def fuzzy_search_candidates(
     ]
 
     if not cleaned:
-        return []
+        return [], 0
 
-    sql = text("""
+    cte = r"""
         WITH kw AS (
             SELECT unnest(CAST(:keywords AS text[])) AS keyword
         ),
@@ -187,28 +189,42 @@ def fuzzy_search_candidates(
             FROM per_keyword
             GROUP BY id, name, cv_url, stack
         )
+    """
+    count_sql = text(cte + """
+        SELECT COUNT(*)
+        FROM aggregated
+        WHERE final_sim >= :threshold
+    """)
+    page_sql = text(cte + """
         SELECT
             a.id, a.name, a.cv_url, a.stack,
             ROUND((a.final_sim * 100)::numeric, 2) AS score
         FROM aggregated a
         WHERE a.final_sim >= :threshold
-        ORDER BY score DESC
-        """)
+        ORDER BY a.final_sim DESC, a.id ASC
+        LIMIT :limit OFFSET :offset
+    """)
 
     session = SessionLocal()
     try:
+        params = {
+            "keywords": cleaned,
+            "threshold": threshold,
+            "departments": cleaned_departments,
+            "limit": page_size,
+            "offset": (page - 1) * page_size,
+        }
+        total = int(session.execute(count_sql, params).scalar() or 0)
         rows = (
             session.execute(
-                sql,
-                {
-                    "keywords": cleaned,
-                    "threshold": threshold,
-                    "departments": cleaned_departments,
-                },
+                page_sql,
+                params,
             )
             .mappings()
             .all()
         )
+        if not rows:
+            return [], total
 
         names = list(set([r["name"] for r in rows]))
         all_cands = (
@@ -253,6 +269,6 @@ def fuzzy_search_candidates(
                     "badge_text": badge_text,
                 }
             )
-        return results
+        return results, total
     finally:
         session.close()
