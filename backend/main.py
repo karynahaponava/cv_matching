@@ -24,6 +24,7 @@ from sqlalchemy import func, or_
 from database.db import Base, SessionLocal, engine
 from database.models import (
     Candidate,
+    MaintenanceState,
     Submission,
     Vacancy,
     TelegramVacancy,
@@ -34,6 +35,7 @@ from services.google_docs import (
     get_doc_metadata_batch,
     get_doc_snapshot,
     get_doc_text,
+    is_permanent_drive_error,
 )
 from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
 from services.cv_parser import extract_all_from_text
@@ -61,7 +63,7 @@ DRIVE_MAX_BACKOFF_SECONDS = 7 * 24 * 60 * 60
 INTERRUPTED_SYNC_STATUS = (
     "❌ Предыдущая синхронизация прервана перезапуском сервиса."
 )
-LAST_CV_PARSING_FILE = "last_cv_parsing_at.txt"
+LAST_CV_PARSING_STATE_KEY = "cv_parsing"
 
 
 class PaginationRequest(BaseModel):
@@ -184,20 +186,59 @@ def update_status(text: str):
         f.write(text)
 
 
-def record_last_cv_parsing_at() -> str:
-    """Persist the UTC completion time of the latest successful parsing run."""
-    parsed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with open(LAST_CV_PARSING_FILE, "w", encoding="utf-8") as timestamp_file:
-        timestamp_file.write(parsed_at)
-    return parsed_at
+def record_last_cv_parsing_at() -> str | None:
+    """Persist parsing completion without letting observability break the pipeline."""
+    parsed_at = datetime.now(timezone.utc)
+    session = None
+    try:
+        session = SessionLocal()
+        state = session.get(MaintenanceState, LAST_CV_PARSING_STATE_KEY)
+        if state is None:
+            state = MaintenanceState(
+                name=LAST_CV_PARSING_STATE_KEY,
+                completed_at=parsed_at,
+            )
+            session.add(state)
+        else:
+            state.completed_at = parsed_at
+        session.commit()
+        return parsed_at.isoformat().replace("+00:00", "Z")
+    except Exception as exc:
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        print(f"[Статус parsing] Не удалось сохранить время завершения: {exc}")
+        return None
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"[Статус parsing] Не удалось закрыть DB-сессию: {exc}")
 
 
 def get_last_cv_parsing_at() -> str | None:
+    session = None
     try:
-        with open(LAST_CV_PARSING_FILE, "r", encoding="utf-8") as timestamp_file:
-            return timestamp_file.read().strip() or None
-    except FileNotFoundError:
+        session = SessionLocal()
+        state = session.get(MaintenanceState, LAST_CV_PARSING_STATE_KEY)
+        if state is None:
+            return None
+        parsed_at = state.completed_at
+        if parsed_at.tzinfo is None:
+            parsed_at = parsed_at.replace(tzinfo=timezone.utc)
+        return parsed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception as exc:
+        print(f"[Статус parsing] Не удалось прочитать время завершения: {exc}")
         return None
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"[Статус parsing] Не удалось закрыть DB-сессию: {exc}")
 
 
 def _status_looks_running(status: str) -> bool:
@@ -256,10 +297,9 @@ def candidate_ready_for_embedding(candidate) -> bool:
 
 def drive_retry_delay(error: Exception, failure_count: int) -> timedelta:
     """Return exponential retry delay, with a longer pause for 403/404 links."""
-    status = getattr(getattr(error, "resp", None), "status", None)
     base_seconds = (
         DRIVE_PERMANENT_BACKOFF_SECONDS
-        if status in (403, 404)
+        if is_permanent_drive_error(error)
         else DRIVE_TRANSIENT_BACKOFF_SECONDS
     )
     delay_seconds = min(

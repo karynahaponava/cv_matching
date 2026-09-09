@@ -1,11 +1,15 @@
 import os
 import re
 import io
+import json
+import random
 import threading
 import time
 from dataclasses import dataclass
 
 import docx
+import google_auth_httplib2
+import httplib2
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 from google.oauth2 import service_account
@@ -44,11 +48,18 @@ class _GoogleServices:
     credentials: object
     drive: object
     docs: object
+    drive_http: object
 
 
 _thread_local = threading.local()
 BATCH_SIZE = 100
 BATCH_ATTEMPTS = 3
+HTTP_TIMEOUT_SECONDS = 15
+BATCH_DEADLINE_SECONDS = 50
+RETRYABLE_403_REASONS = {
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+}
 
 
 def extract_doc_id(url: str) -> str | None:
@@ -75,14 +86,23 @@ def _get_services() -> _GoogleServices:
     services = getattr(_thread_local, "google_services", None)
     if services is None:
         credentials = _get_credentials()
+        drive_http = google_auth_httplib2.AuthorizedHttp(
+            credentials,
+            http=httplib2.Http(timeout=HTTP_TIMEOUT_SECONDS),
+        )
+        docs_http = google_auth_httplib2.AuthorizedHttp(
+            credentials,
+            http=httplib2.Http(timeout=HTTP_TIMEOUT_SECONDS),
+        )
         services = _GoogleServices(
             credentials=credentials,
             drive=build(
-                "drive", "v3", credentials=credentials, cache_discovery=False
+                "drive", "v3", http=drive_http, cache_discovery=False
             ),
             docs=build(
-                "docs", "v1", credentials=credentials, cache_discovery=False
+                "docs", "v1", http=docs_http, cache_discovery=False
             ),
+            drive_http=drive_http,
         )
         _thread_local.google_services = services
     return services
@@ -113,40 +133,45 @@ def _read_structural_elements(elements: list) -> str:
 
 
 def _fetch_via_docs_api(service, doc_id: str) -> str:
-    document = service.documents().get(documentId=doc_id).execute()
+    document = service.documents().get(documentId=doc_id).execute(num_retries=2)
     content = document.get("body", {}).get("content", [])
     return _read_structural_elements(content).strip()
 
 
 def _fetch_via_drive_export(service, doc_id: str, mime_type: str) -> str:
     if mime_type == "application/vnd.google-apps.document":
-        raw = service.files().export(fileId=doc_id, mimeType="text/plain").execute()
+        raw = service.files().export(
+            fileId=doc_id, mimeType="text/plain"
+        ).execute(num_retries=2)
         if isinstance(raw, bytes):
             return raw.decode("utf-8").strip()
         return str(raw).strip()
 
     elif mime_type == "application/pdf":
         request = service.files().get_media(fileId=doc_id)
-        file_content = request.execute()
+        file_content = request.execute(num_retries=2)
         reader = PdfReader(io.BytesIO(file_content))
         text = ""
         for page in reader.pages:
             text += page.extract_text() + "\n"
         return text.strip()
 
-    elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+    elif (
+        mime_type
+        == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ):
         request = service.files().get_media(fileId=doc_id)
-        file_content = request.execute()
+        file_content = request.execute(num_retries=2)
         doc = docx.Document(io.BytesIO(file_content))
-        
+
         full_text = [p.text for p in doc.paragraphs]
-        
+
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     if cell.text.strip():
                         full_text.append(cell.text.strip())
-                        
+
         return "\n".join(full_text)
 
     return ""
@@ -160,10 +185,48 @@ def _revision_token(metadata: dict) -> str | None:
     return f"version={version or ''};modifiedTime={modified_time or ''}"
 
 
-def _retryable_error(error: Exception) -> bool:
+def drive_error_reasons(error: Exception) -> set[str]:
+    if not isinstance(error, HttpError):
+        return set()
+    try:
+        content = (
+            error.content.decode("utf-8")
+            if isinstance(error.content, bytes)
+            else error.content
+        )
+        payload = json.loads(content)
+    except (AttributeError, TypeError, ValueError):
+        return set()
+
+    details = payload.get("error", {}).get("errors", [])
+    return {
+        str(detail.get("reason"))
+        for detail in details
+        if isinstance(detail, dict) and detail.get("reason")
+    }
+
+
+def is_retryable_drive_error(error: Exception) -> bool:
     if isinstance(error, HttpError):
-        return error.resp.status == 429 or error.resp.status >= 500
+        status = error.resp.status
+        return (
+            status == 408
+            or status == 429
+            or status >= 500
+            or (
+                status == 403
+                and bool(drive_error_reasons(error) & RETRYABLE_403_REASONS)
+            )
+        )
     return True
+
+
+def is_permanent_drive_error(error: Exception) -> bool:
+    if not isinstance(error, HttpError):
+        return False
+    if is_retryable_drive_error(error):
+        return False
+    return error.resp.status in (403, 404)
 
 
 def get_doc_metadata_batch(doc_urls: list[str]) -> list[DocumentMetadata]:
@@ -172,6 +235,7 @@ def get_doc_metadata_batch(doc_urls: list[str]) -> list[DocumentMetadata]:
         raise ValueError(f"Размер batch не должен превышать {BATCH_SIZE}")
 
     services = _get_services()
+    started_at = time.monotonic()
     results: list[DocumentMetadata | None] = [None] * len(doc_urls)
     pending = {
         index: doc_id
@@ -185,7 +249,7 @@ def get_doc_metadata_batch(doc_urls: list[str]) -> list[DocumentMetadata]:
             )
 
     for attempt in range(BATCH_ATTEMPTS):
-        if not pending:
+        if not pending or time.monotonic() - started_at >= BATCH_DEADLINE_SECONDS:
             break
 
         attempt_results: dict[int, DocumentMetadata] = {}
@@ -213,7 +277,7 @@ def get_doc_metadata_batch(doc_urls: list[str]) -> list[DocumentMetadata]:
 
         outer_error = None
         try:
-            batch.execute()
+            batch.execute(http=services.drive_http)
         except Exception as exc:
             outer_error = exc
 
@@ -227,8 +291,9 @@ def get_doc_metadata_batch(doc_urls: list[str]) -> list[DocumentMetadata]:
 
             if (
                 result.error is not None
-                and _retryable_error(result.error)
+                and is_retryable_drive_error(result.error)
                 and attempt + 1 < BATCH_ATTEMPTS
+                and time.monotonic() - started_at < BATCH_DEADLINE_SECONDS
             ):
                 retry_pending[index] = doc_id
             else:
@@ -236,7 +301,9 @@ def get_doc_metadata_batch(doc_urls: list[str]) -> list[DocumentMetadata]:
 
         pending = retry_pending
         if pending:
-            time.sleep(0.25 * (2**attempt))
+            remaining = BATCH_DEADLINE_SECONDS - (time.monotonic() - started_at)
+            if remaining > 0:
+                time.sleep(min(0.5 * (2**attempt) + random.random(), remaining))
 
     for index in pending:
         if results[index] is None:
@@ -264,8 +331,7 @@ def get_doc_snapshot(
     if metadata.error is not None:
         # Some shared Google Docs can still be read through the Docs API even when
         # Drive metadata is unavailable. In that case compare content hashes.
-        status = getattr(getattr(metadata.error, "resp", None), "status", None)
-        if status not in (403, 404):
+        if not is_permanent_drive_error(metadata.error):
             raise metadata.error
         try:
             text = _fetch_via_docs_api(services.docs, doc_id)

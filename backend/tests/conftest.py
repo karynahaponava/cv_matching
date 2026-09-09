@@ -31,6 +31,9 @@ class _Model:
     cv_content_hash = parsed_content_hash = parsed_with_version = _Expression()
     cv_source_check_failures = cv_source_next_check_at = _Expression()
 
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
 
 database_db = types.ModuleType("database.db")
 database_db.Base = types.SimpleNamespace(metadata=types.SimpleNamespace(create_all=lambda **_: None))
@@ -43,6 +46,7 @@ for model_name in (
     "Vacancy",
     "TelegramVacancy",
     "TelegramChannelState",
+    "MaintenanceState",
 ):
     setattr(database_models, model_name, type(model_name, (_Model,), {}))
 sys.modules["database.db"] = database_db
@@ -68,11 +72,6 @@ requests.Timeout = type("Timeout", (requests.RequestException,), {})
 requests.ConnectionError = type("ConnectionError", (requests.RequestException,), {})
 sys.modules["requests"] = requests
 
-google_errors = types.ModuleType("googleapiclient.errors")
-google_errors.HttpError = type("HttpError", (Exception,), {})
-sys.modules["googleapiclient"] = types.ModuleType("googleapiclient")
-sys.modules["googleapiclient.errors"] = google_errors
-
 background = types.ModuleType("apscheduler.schedulers.background")
 background.BackgroundScheduler = type("BackgroundScheduler", (), {})
 sys.modules["apscheduler"] = types.ModuleType("apscheduler")
@@ -96,6 +95,9 @@ service_stubs = {
         ],
         "get_doc_snapshot": lambda *_: types.SimpleNamespace(revision=None, text=""),
         "get_doc_text": lambda *_: "",
+        "is_permanent_drive_error": lambda error: getattr(
+            getattr(error, "resp", None), "status", None
+        ) in (403, 404),
     },
     "services.google_sheets": {
         "sync_candidates_from_cloud": lambda *_: {},

@@ -41,6 +41,13 @@ class Candidate(Base):
         return value
 
 
+class MaintenanceState(Base):
+    __tablename__ = "maintenance_state"
+
+    name = Column(String(64), primary_key=True)
+    completed_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class Vacancy(Base):
     __tablename__ = "vacancies"
 

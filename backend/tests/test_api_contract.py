@@ -545,21 +545,22 @@ def test_parser_commits_in_batches(monkeypatch):
     assert session.commits == 2
 
 
-def test_parse_endpoint_forwards_force_and_releases_lock(monkeypatch, tmp_path):
+def test_parse_endpoint_forwards_force_and_releases_lock(monkeypatch):
     captured = {}
-    monkeypatch.chdir(tmp_path)
+    recorded = []
 
     def parse(days_limit=None, force=False):
         captured.update(days_limit=days_limit, force=force)
         return {"updated": 0}
 
     monkeypatch.setattr(main, "internal_parse_cv_stacks", parse)
+    monkeypatch.setattr(
+        main, "record_last_cv_parsing_at", lambda: recorded.append(True)
+    )
 
     assert main.parse_cv_stacks(days_limit=7, force=True) == {"updated": 0}
     assert captured == {"days_limit": 7, "force": True}
-    saved_timestamp = (tmp_path / main.LAST_CV_PARSING_FILE).read_text()
-    parsed_timestamp = datetime.fromisoformat(saved_timestamp.replace("Z", "+00:00"))
-    assert parsed_timestamp.utcoffset().total_seconds() == 0
+    assert recorded == [True]
     assert not main._sync_lock.locked()
 
 
@@ -567,14 +568,61 @@ def test_sync_status_returns_last_parsing_timestamp(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     completed_status = "Синхронизация полностью завершена"
     Path("sync_status.txt").write_text(completed_status, encoding="utf-8")
-    Path(main.LAST_CV_PARSING_FILE).write_text(
-        "2026-09-09T09:30:00Z", encoding="utf-8"
+    monkeypatch.setattr(
+        main, "get_last_cv_parsing_at", lambda: "2026-09-09T09:30:00Z"
     )
 
     assert main.get_sync_status() == {
         "status": completed_status,
         "last_parsed_at": "2026-09-09T09:30:00Z",
     }
+
+
+class MaintenanceStateSession:
+    def __init__(self):
+        self.state = None
+        self.commits = 0
+        self.rollbacks = 0
+
+    def get(self, _model, name):
+        if self.state is not None and self.state.name == name:
+            return self.state
+        return None
+
+    def add(self, state):
+        self.state = state
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        pass
+
+
+def test_last_parsing_timestamp_is_persisted_in_database(monkeypatch):
+    session = MaintenanceStateSession()
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+
+    saved_timestamp = main.record_last_cv_parsing_at()
+
+    assert session.state.name == main.LAST_CV_PARSING_STATE_KEY
+    assert session.state.completed_at.tzinfo is not None
+    assert session.commits == 1
+    assert main.get_last_cv_parsing_at() == saved_timestamp
+
+
+def test_last_parsing_timestamp_failure_does_not_escape(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "SessionLocal",
+        lambda: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    assert main.record_last_cv_parsing_at() is None
+    assert main.get_last_cv_parsing_at() is None
 
 
 def test_nightly_job_checks_all_cv_revisions(monkeypatch):

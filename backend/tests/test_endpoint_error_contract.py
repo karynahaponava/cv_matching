@@ -66,6 +66,8 @@ class FakeModel:
     cv_content_hash = FakeColumn()
     parsed_content_hash = FakeColumn()
     parsed_with_version = FakeColumn()
+    cv_source_check_failures = FakeColumn()
+    cv_source_next_check_at = FakeColumn()
     created_at = FakeColumn()
     department = FakeColumn()
     candidate_id = FakeColumn()
@@ -192,6 +194,7 @@ def _install_main_import_stubs() -> None:
         Vacancy=FakeModel,
         TelegramVacancy=FakeModel,
         TelegramChannelState=FakeModel,
+        MaintenanceState=FakeModel,
     )
 
     _module("services").__path__ = []
@@ -203,6 +206,7 @@ def _install_main_import_stubs() -> None:
         ],
         get_doc_snapshot=lambda *args: SimpleNamespace(revision=None, text=""),
         get_doc_text=lambda url: "",
+        is_permanent_drive_error=lambda error: False,
     )
     _module(
         "services.google_sheets",
