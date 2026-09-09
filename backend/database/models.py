@@ -31,6 +31,8 @@ class Candidate(Base):
     cv_content_hash = Column(String(64), nullable=True)
     parsed_content_hash = Column(String(64), nullable=True)
     parsed_with_version = Column(Integer, nullable=True)
+    cv_source_check_failures = Column(Integer, nullable=False, default=0)
+    cv_source_next_check_at = Column(DateTime, nullable=True)
 
     @validates('created_at')
     def validate_created_at(self, key, value):

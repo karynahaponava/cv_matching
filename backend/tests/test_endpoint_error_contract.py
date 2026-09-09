@@ -198,6 +198,9 @@ def _install_main_import_stubs() -> None:
     _module(
         "services.google_docs",
         extract_doc_id=lambda url: "doc-id" if url else None,
+        get_doc_metadata_batch=lambda urls: [
+            SimpleNamespace(revision=None, mime_type="", error=None) for _ in urls
+        ],
         get_doc_snapshot=lambda *args: SimpleNamespace(revision=None, text=""),
         get_doc_text=lambda url: "",
     )

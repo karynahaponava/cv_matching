@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -316,6 +316,8 @@ def make_candidate(**overrides):
         "cv_content_hash": current_hash,
         "parsed_content_hash": current_hash,
         "parsed_with_version": main.CURRENT_CV_PARSER_VERSION,
+        "cv_source_check_failures": 0,
+        "cv_source_next_check_at": None,
         "stack": "Python",
         "seniority": "Senior",
         "direction": "Backend",
@@ -335,16 +337,28 @@ def test_cv_text_sync_uses_revision_and_hash(monkeypatch):
     monkeypatch.setattr(main, "SessionLocal", lambda: session)
     monkeypatch.setattr(main, "extract_doc_id", lambda url: None if url == "invalid" else url)
 
-    def snapshot(url, known_revision):
+    def metadata_batch(urls):
+        values = {
+            "unchanged": SimpleNamespace(revision="r1", mime_type="", error=None),
+            "metadata": SimpleNamespace(revision="r2", mime_type="", error=None),
+            "changed": SimpleNamespace(revision="r2", mime_type="", error=None),
+            "failed": SimpleNamespace(
+                revision=None,
+                mime_type="",
+                error=RuntimeError("drive unavailable"),
+            ),
+        }
+        return [values[url] for url in urls]
+
+    def snapshot(url, known_revision, _metadata):
         assert known_revision == "r1"
-        if url == "unchanged":
-            return SimpleNamespace(revision="r1", text=None)
         if url == "metadata":
             return SimpleNamespace(revision="r2", text="old text")
         if url == "changed":
             return SimpleNamespace(revision="r2", text="new\r\ntext ")
         raise RuntimeError("drive unavailable")
 
+    monkeypatch.setattr(main, "get_doc_metadata_batch", metadata_batch)
     monkeypatch.setattr(main, "get_doc_snapshot", snapshot)
 
     result = asyncio.run(main.internal_update_cv_texts())
@@ -364,23 +378,62 @@ def test_cv_text_sync_uses_revision_and_hash(monkeypatch):
     assert changed.embedding is None
     assert failed.cv_source_revision == "r1"
     assert failed.cv_text == "old text"
+    assert failed.cv_source_check_failures == 1
+    assert failed.cv_source_next_check_at is not None
 
 
 def test_cv_text_sync_commits_revision_progress_in_batches(monkeypatch):
     candidates = [make_candidate(id=index, cv_url=f"doc-{index}") for index in range(101)]
     session = MaintenanceSession(candidates)
+    batch_sizes = []
     monkeypatch.setattr(main, "SessionLocal", lambda: session)
     monkeypatch.setattr(main, "extract_doc_id", lambda url: url)
-    monkeypatch.setattr(
-        main,
-        "get_doc_snapshot",
-        lambda _url, revision: SimpleNamespace(revision=revision, text=None),
-    )
+
+    def metadata_batch(urls):
+        batch_sizes.append(len(urls))
+        return [
+            SimpleNamespace(revision="revision-1", mime_type="", error=None)
+            for _ in urls
+        ]
+
+    monkeypatch.setattr(main, "get_doc_metadata_batch", metadata_batch)
 
     result = asyncio.run(main.internal_update_cv_texts())
 
     assert result["unchanged"] == 101
     assert session.commits == 2
+    assert batch_sizes == [100, 1]
+
+
+def test_cv_text_sync_skips_candidate_during_backoff(monkeypatch):
+    candidate = make_candidate(
+        cv_source_check_failures=2,
+        cv_source_next_check_at=datetime.utcnow() + timedelta(hours=1),
+    )
+    session = MaintenanceSession([candidate])
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(
+        main,
+        "get_doc_metadata_batch",
+        lambda _urls: (_ for _ in ()).throw(AssertionError("must be skipped")),
+    )
+
+    result = asyncio.run(main.internal_update_cv_texts())
+
+    assert result["checked"] == 1
+    assert result["skipped"] == 1
+    assert result["errors"] == 0
+
+
+def test_drive_retry_delay_is_longer_for_permanent_errors():
+    transient = RuntimeError("connection refused")
+    permanent = RuntimeError("not found")
+    permanent.resp = SimpleNamespace(status=404)
+
+    assert main.drive_retry_delay(transient, 1) == timedelta(minutes=5)
+    assert main.drive_retry_delay(transient, 2) == timedelta(minutes=10)
+    assert main.drive_retry_delay(permanent, 1) == timedelta(days=1)
+    assert main.drive_retry_delay(permanent, 4) == timedelta(days=7)
 
 
 def test_incremental_parser_skips_unchanged_and_retries_failures(monkeypatch):

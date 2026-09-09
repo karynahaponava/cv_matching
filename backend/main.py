@@ -29,7 +29,12 @@ from database.models import (
     TelegramVacancy,
     TelegramChannelState,
 )
-from services.google_docs import extract_doc_id, get_doc_snapshot, get_doc_text
+from services.google_docs import (
+    extract_doc_id,
+    get_doc_metadata_batch,
+    get_doc_snapshot,
+    get_doc_text,
+)
 from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
 from services.cv_parser import extract_all_from_text
 from services.fuzzy_search import fuzzy_search_candidates
@@ -50,6 +55,9 @@ MAX_PAGE_SIZE = 100
 CURRENT_CV_PARSER_VERSION = 1
 CV_SYNC_COMMIT_BATCH_SIZE = 100
 PARSING_COMMIT_BATCH_SIZE = 100
+DRIVE_TRANSIENT_BACKOFF_SECONDS = 5 * 60
+DRIVE_PERMANENT_BACKOFF_SECONDS = 24 * 60 * 60
+DRIVE_MAX_BACKOFF_SECONDS = 7 * 24 * 60 * 60
 INTERRUPTED_SYNC_STATUS = (
     "❌ Предыдущая синхронизация прервана перезапуском сервиса."
 )
@@ -246,6 +254,21 @@ def candidate_ready_for_embedding(candidate) -> bool:
     )
 
 
+def drive_retry_delay(error: Exception, failure_count: int) -> timedelta:
+    """Return exponential retry delay, with a longer pause for 403/404 links."""
+    status = getattr(getattr(error, "resp", None), "status", None)
+    base_seconds = (
+        DRIVE_PERMANENT_BACKOFF_SECONDS
+        if status in (403, 404)
+        else DRIVE_TRANSIENT_BACKOFF_SECONDS
+    )
+    delay_seconds = min(
+        base_seconds * (2 ** min(max(failure_count - 1, 0), 6)),
+        DRIVE_MAX_BACKOFF_SECONDS,
+    )
+    return timedelta(seconds=delay_seconds)
+
+
 async def internal_update_cv_texts(days_limit: int = None):
     """Check Drive revisions and download only new or changed resume texts."""
     session = SessionLocal()
@@ -277,53 +300,92 @@ async def internal_update_cv_texts(days_limit: int = None):
 
         semaphore = asyncio.Semaphore(5)
 
-        async def fetch_candidate(i, cand):
-            if not extract_doc_id(cand.cv_url):
-                stats["skipped"] += 1
-                return
+        async def fetch_candidate(i, cand, metadata):
+            known_revision = cand.cv_source_revision if cand.cv_content_hash else None
+            try:
+                if (
+                    metadata.error is None
+                    and metadata.revision
+                    and metadata.revision == known_revision
+                ):
+                    cand.cv_source_check_failures = 0
+                    cand.cv_source_next_check_at = None
+                    stats["unchanged"] += 1
+                    return
 
-            async with semaphore:
-                try:
-                    known_revision = (
-                        cand.cv_source_revision if cand.cv_content_hash else None
-                    )
+                async with semaphore:
                     snapshot = await asyncio.to_thread(
-                        get_doc_snapshot, cand.cv_url, known_revision
+                        get_doc_snapshot,
+                        cand.cv_url,
+                        known_revision,
+                        metadata,
                     )
 
-                    if snapshot.text is None:
-                        stats["unchanged"] += 1
-                        return
+                cand.cv_source_check_failures = 0
+                cand.cv_source_next_check_at = None
+                if snapshot.text is None:
+                    stats["unchanged"] += 1
+                    return
 
-                    normalized_text = normalize_cv_text(snapshot.text)
-                    if not normalized_text:
-                        raise ValueError("Документ не содержит текста")
+                normalized_text = normalize_cv_text(snapshot.text)
+                if not normalized_text:
+                    raise ValueError("Документ не содержит текста")
 
-                    new_hash = cv_content_hash(normalized_text)
-                    if new_hash == cand.cv_content_hash:
-                        if snapshot.revision is not None:
-                            cand.cv_source_revision = snapshot.revision
-                        stats["unchanged"] += 1
-                        return
-
-                    cand.cv_text = normalized_text
-                    cand.cv_content_hash = new_hash
+                new_hash = cv_content_hash(normalized_text)
+                if new_hash == cand.cv_content_hash:
                     if snapshot.revision is not None:
                         cand.cv_source_revision = snapshot.revision
-                    cand.embedding = None
-                    stats["updated"] += 1
-                    print(f"[{i}/{total}] CV изменено: {cand.name[:40]}")
-                except Exception as e:
-                    stats["errors"] += 1
-                    print(f"[{i}/{total}] Ошибка CV [{cand.name[:40]}]: {e}")
+                    stats["unchanged"] += 1
+                    return
+
+                cand.cv_text = normalized_text
+                cand.cv_content_hash = new_hash
+                if snapshot.revision is not None:
+                    cand.cv_source_revision = snapshot.revision
+                cand.embedding = None
+                stats["updated"] += 1
+                print(f"[{i}/{total}] CV изменено: {cand.name[:40]}")
+            except Exception as error:
+                failure_count = (cand.cv_source_check_failures or 0) + 1
+                cand.cv_source_check_failures = failure_count
+                cand.cv_source_next_check_at = datetime.utcnow() + drive_retry_delay(
+                    error, failure_count
+                )
+                stats["errors"] += 1
+                print(
+                    f"[{i}/{total}] Ошибка CV [{cand.name[:40]}]: {error}; "
+                    f"повтор после {cand.cv_source_next_check_at.isoformat()}Z"
+                )
 
         for batch_start in range(0, total, CV_SYNC_COMMIT_BATCH_SIZE):
             batch = candidates[
                 batch_start : batch_start + CV_SYNC_COMMIT_BATCH_SIZE
             ]
+            now = datetime.utcnow()
+            candidates_to_check = []
+            for offset, cand in enumerate(batch, 1):
+                if not extract_doc_id(cand.cv_url):
+                    stats["skipped"] += 1
+                    continue
+                if (
+                    cand.cv_source_next_check_at is not None
+                    and cand.cv_source_next_check_at > now
+                ):
+                    stats["skipped"] += 1
+                    continue
+                candidates_to_check.append((batch_start + offset, cand))
+
+            metadata_results = []
+            if candidates_to_check:
+                metadata_results = await asyncio.to_thread(
+                    get_doc_metadata_batch,
+                    [cand.cv_url for _, cand in candidates_to_check],
+                )
             tasks = [
-                fetch_candidate(batch_start + offset, cand)
-                for offset, cand in enumerate(batch, 1)
+                fetch_candidate(index, cand, metadata)
+                for (index, cand), metadata in zip(
+                    candidates_to_check, metadata_results, strict=True
+                )
             ]
             await asyncio.gather(*tasks)
             session.commit()

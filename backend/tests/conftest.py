@@ -29,6 +29,7 @@ class _Expression:
 class _Model:
     id = name = cv_url = cv_text = embedding = direction = created_at = department = _Expression()
     cv_content_hash = parsed_content_hash = parsed_with_version = _Expression()
+    cv_source_check_failures = cv_source_next_check_at = _Expression()
 
 
 database_db = types.ModuleType("database.db")
@@ -89,6 +90,10 @@ sys.modules["services.embeddings"] = embeddings
 service_stubs = {
     "services.google_docs": {
         "extract_doc_id": lambda url: "doc-id" if url else None,
+        "get_doc_metadata_batch": lambda urls: [
+            types.SimpleNamespace(revision=None, mime_type="", error=None)
+            for _ in urls
+        ],
         "get_doc_snapshot": lambda *_: types.SimpleNamespace(revision=None, text=""),
         "get_doc_text": lambda *_: "",
     },
