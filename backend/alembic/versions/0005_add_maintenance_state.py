@@ -18,6 +18,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    connection = op.get_bind()
+    if sa.inspect(connection).has_table("maintenance_state"):
+        # In local development uvicorn runs with --reload and the application
+        # still calls Base.metadata.create_all(). A model reload can therefore
+        # create this table before Alembic gets a chance to run the migration.
+        return
+
     op.create_table(
         "maintenance_state",
         sa.Column("name", sa.String(length=64), nullable=False),
