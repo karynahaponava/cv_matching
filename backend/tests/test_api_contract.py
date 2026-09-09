@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -274,3 +275,245 @@ def test_terminal_sync_status_is_preserved(monkeypatch, tmp_path, terminal_statu
 
     assert main.recover_stale_sync_status() == terminal_status
     assert status_file.read_text(encoding="utf-8") == terminal_status
+
+
+class MaintenanceSession:
+    def __init__(self, candidates):
+        self.candidates = candidates
+        self.commits = 0
+
+    def query(self, _model):
+        return self
+
+    def filter(self, *_args):
+        return self
+
+    def all(self):
+        return self.candidates
+
+    def count(self):
+        return len(self.candidates)
+
+    def commit(self):
+        self.commits += 1
+
+    def close(self):
+        pass
+
+
+def make_candidate(**overrides):
+    current_hash = main.cv_content_hash("old text")
+    values = {
+        "id": 1,
+        "name": "Candidate",
+        "cv_url": "https://docs.google.com/document/d/doc-id/edit",
+        "cv_text": "old text",
+        "cv_source_revision": "revision-1",
+        "cv_content_hash": current_hash,
+        "parsed_content_hash": current_hash,
+        "parsed_with_version": main.CURRENT_CV_PARSER_VERSION,
+        "stack": "Python",
+        "seniority": "Senior",
+        "direction": "Backend",
+        "embedding": b"existing-vector",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_cv_text_sync_uses_revision_and_hash(monkeypatch):
+    unchanged = make_candidate(id=1, cv_url="unchanged", cv_source_revision="r1")
+    metadata_only = make_candidate(id=2, cv_url="metadata", cv_source_revision="r1")
+    changed = make_candidate(id=3, cv_url="changed", cv_source_revision="r1")
+    failed = make_candidate(id=4, cv_url="failed", cv_source_revision="r1")
+    skipped = make_candidate(id=5, cv_url="invalid")
+    session = MaintenanceSession([unchanged, metadata_only, changed, failed, skipped])
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(main, "extract_doc_id", lambda url: None if url == "invalid" else url)
+
+    def snapshot(url, known_revision):
+        assert known_revision == "r1"
+        if url == "unchanged":
+            return SimpleNamespace(revision="r1", text=None)
+        if url == "metadata":
+            return SimpleNamespace(revision="r2", text="old text")
+        if url == "changed":
+            return SimpleNamespace(revision="r2", text="new\r\ntext ")
+        raise RuntimeError("drive unavailable")
+
+    monkeypatch.setattr(main, "get_doc_snapshot", snapshot)
+
+    result = asyncio.run(main.internal_update_cv_texts())
+
+    assert result == {
+        "checked": 5,
+        "updated": 1,
+        "unchanged": 2,
+        "skipped": 1,
+        "errors": 1,
+    }
+    assert metadata_only.cv_source_revision == "r2"
+    assert metadata_only.embedding == b"existing-vector"
+    assert changed.cv_text == "new\ntext"
+    assert changed.cv_content_hash == main.cv_content_hash("new\ntext")
+    assert changed.parsed_content_hash == main.cv_content_hash("old text")
+    assert changed.embedding is None
+    assert failed.cv_source_revision == "r1"
+    assert failed.cv_text == "old text"
+
+
+def test_cv_text_sync_commits_revision_progress_in_batches(monkeypatch):
+    candidates = [make_candidate(id=index, cv_url=f"doc-{index}") for index in range(101)]
+    session = MaintenanceSession(candidates)
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(main, "extract_doc_id", lambda url: url)
+    monkeypatch.setattr(
+        main,
+        "get_doc_snapshot",
+        lambda _url, revision: SimpleNamespace(revision=revision, text=None),
+    )
+
+    result = asyncio.run(main.internal_update_cv_texts())
+
+    assert result["unchanged"] == 101
+    assert session.commits == 2
+
+
+def test_incremental_parser_skips_unchanged_and_retries_failures(monkeypatch):
+    unchanged = make_candidate(id=1)
+    changed = make_candidate(
+        id=2,
+        cv_text="new text",
+        cv_content_hash=main.cv_content_hash("new text"),
+    )
+    outdated_parser = make_candidate(id=3, parsed_with_version=0)
+    failed = make_candidate(
+        id=4,
+        cv_text="broken text",
+        cv_content_hash=main.cv_content_hash("broken text"),
+    )
+    session = MaintenanceSession([unchanged, changed, outdated_parser, failed])
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+
+    def parse(text):
+        if text == "broken text":
+            raise ValueError("cannot parse")
+        return {"stack": "Go" if text == "new text" else "Python", "seniority": "Senior", "direction": "Backend"}
+
+    monkeypatch.setattr(main, "extract_all_from_text", parse)
+    result = main.internal_parse_cv_stacks()
+
+    assert result["checked"] == 4
+    assert result["updated"] == 2
+    assert result["unchanged"] == 1
+    assert result["errors"] == 1
+    assert changed.parsed_content_hash == changed.cv_content_hash
+    assert changed.embedding is None
+    assert outdated_parser.parsed_with_version == main.CURRENT_CV_PARSER_VERSION
+    assert outdated_parser.embedding == b"existing-vector"
+    assert failed.parsed_content_hash != failed.cv_content_hash
+
+
+def test_second_incremental_parse_does_no_work_and_force_reparses(monkeypatch):
+    candidate = make_candidate(
+        cv_text="new text",
+        cv_content_hash=main.cv_content_hash("new text"),
+    )
+    session = MaintenanceSession([candidate])
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    calls = []
+
+    def parse(text):
+        calls.append(text)
+        return {"stack": "Python", "seniority": "Senior", "direction": "Backend"}
+
+    monkeypatch.setattr(main, "extract_all_from_text", parse)
+
+    first = main.internal_parse_cv_stacks()
+    second = main.internal_parse_cv_stacks()
+    forced = main.internal_parse_cv_stacks(force=True)
+
+    assert first["updated"] == 1
+    assert second["updated"] == 0
+    assert second["unchanged"] == 1
+    assert forced["updated"] == 1
+    assert calls == ["new text", "new text"]
+
+
+def test_embeddings_only_use_successfully_parsed_current_content(monkeypatch):
+    ready = make_candidate(id=1, embedding=None)
+    dirty = make_candidate(
+        id=2,
+        embedding=None,
+        cv_content_hash=main.cv_content_hash("new text"),
+    )
+    session = MaintenanceSession([ready, dirty])
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    calls = []
+    monkeypatch.setattr(main, "embed", lambda text: calls.append(text) or [1.0])
+    monkeypatch.setattr(
+        main.np,
+        "array",
+        lambda *_args, **_kwargs: SimpleNamespace(tobytes=lambda: b"vector"),
+    )
+
+    result = main.internal_build_embeddings()
+
+    assert result["checked"] == 1
+    assert result["updated"] == 1
+    assert calls == ["Python\nold text"]
+    assert dirty.embedding is None
+
+
+def test_parser_commits_in_batches(monkeypatch):
+    candidates = [
+        make_candidate(
+            id=index,
+            cv_text=f"text-{index}",
+            cv_content_hash=main.cv_content_hash(f"text-{index}"),
+        )
+        for index in range(101)
+    ]
+    session = MaintenanceSession(candidates)
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(
+        main,
+        "extract_all_from_text",
+        lambda _text: {"stack": "Python", "seniority": "Senior", "direction": "Backend"},
+    )
+
+    result = main.internal_parse_cv_stacks()
+
+    assert result["updated"] == 101
+    assert session.commits == 2
+
+
+def test_parse_endpoint_forwards_force_and_releases_lock(monkeypatch):
+    captured = {}
+
+    def parse(days_limit=None, force=False):
+        captured.update(days_limit=days_limit, force=force)
+        return {"updated": 0}
+
+    monkeypatch.setattr(main, "internal_parse_cv_stacks", parse)
+
+    assert main.parse_cv_stacks(days_limit=7, force=True) == {"updated": 0}
+    assert captured == {"days_limit": 7, "force": True}
+    assert not main._sync_lock.locked()
+
+
+def test_nightly_job_checks_all_cv_revisions(monkeypatch):
+    captured = []
+    session = MaintenanceSession([])
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(main, "sync_candidates_from_cloud", lambda _session: {})
+
+    async def process(days_limit=None):
+        captured.append(days_limit)
+
+    monkeypatch.setattr(main, "process_cvs_in_background", process)
+
+    main.nightly_maintenance_job()
+
+    assert captured == [None]
+    assert not main._sync_lock.locked()

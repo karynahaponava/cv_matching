@@ -3,7 +3,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.testclient import TestClient
 
-from backend.api_errors import ApiError, external_service_error, install_error_handlers
+from api_errors import ApiError, external_service_error, install_error_handlers
 
 
 def build_test_app() -> FastAPI:

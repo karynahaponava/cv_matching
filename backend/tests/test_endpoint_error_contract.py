@@ -63,6 +63,9 @@ class FakeModel:
     stack = FakeColumn()
     direction = FakeColumn()
     embedding = FakeColumn()
+    cv_content_hash = FakeColumn()
+    parsed_content_hash = FakeColumn()
+    parsed_with_version = FakeColumn()
     created_at = FakeColumn()
     department = FakeColumn()
     candidate_id = FakeColumn()
@@ -192,7 +195,12 @@ def _install_main_import_stubs() -> None:
     )
 
     _module("services").__path__ = []
-    _module("services.google_docs", get_doc_text=lambda url: "")
+    _module(
+        "services.google_docs",
+        extract_doc_id=lambda url: "doc-id" if url else None,
+        get_doc_snapshot=lambda *args: SimpleNamespace(revision=None, text=""),
+        get_doc_text=lambda url: "",
+    )
     _module(
         "services.google_sheets",
         sync_candidates_from_cloud=lambda session: {"added_candidates": 0},

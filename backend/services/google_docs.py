@@ -1,12 +1,13 @@
 import os
 import re
 import io
+from dataclasses import dataclass
+
 import docx
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 load_dotenv()
 
@@ -20,6 +21,12 @@ _DOC_ID_PATTERNS = (
     re.compile(r"/file/d/([a-zA-Z0-9_-]+)"),
     re.compile(r"[?&]id=([a-zA-Z0-9_-]+)"),
 )
+
+
+@dataclass(frozen=True)
+class DocumentSnapshot:
+    revision: str | None
+    text: str | None
 
 
 def extract_doc_id(url: str) -> str | None:
@@ -72,11 +79,7 @@ def _fetch_via_docs_api(doc_id: str, credentials) -> str:
     return _read_structural_elements(content).strip()
 
 
-def _fetch_via_drive_export(doc_id: str, credentials) -> str:
-    service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-    meta = service.files().get(fileId=doc_id, fields="mimeType").execute()
-    mime_type = meta.get("mimeType", "")
-
+def _fetch_via_drive_export(service, doc_id: str, mime_type: str) -> str:
     if mime_type == "application/vnd.google-apps.document":
         raw = service.files().export(fileId=doc_id, mimeType="text/plain").execute()
         if isinstance(raw, bytes):
@@ -110,21 +113,69 @@ def _fetch_via_drive_export(doc_id: str, credentials) -> str:
     return ""
 
 
-def get_doc_text(doc_url: str) -> str:
+def _revision_token(metadata: dict) -> str | None:
+    version = metadata.get("version")
+    modified_time = metadata.get("modifiedTime")
+    if version is None and not modified_time:
+        return None
+    return f"version={version or ''};modifiedTime={modified_time or ''}"
+
+
+def get_doc_snapshot(
+    doc_url: str, known_revision: str | None = None
+) -> DocumentSnapshot:
+    """Return document metadata and content only when its revision is unknown/new."""
     doc_id = extract_doc_id(doc_url)
     if not doc_id:
-        return ""
+        raise ValueError("Не удалось извлечь ID документа из ссылки")
 
     credentials = _get_credentials()
+    drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    metadata = None
 
     try:
-        text = _fetch_via_drive_export(doc_id, credentials)
+        metadata = (
+            drive_service.files()
+            .get(fileId=doc_id, fields="mimeType,version,modifiedTime")
+            .execute()
+        )
+    except Exception as metadata_error:
+        # Some shared Google Docs can still be read through the Docs API even when
+        # Drive metadata is unavailable. In that case compare content hashes.
+        try:
+            text = _fetch_via_docs_api(doc_id, credentials)
+        except Exception:
+            raise metadata_error
+        if not text:
+            raise metadata_error
+        return DocumentSnapshot(revision=None, text=text)
+
+    revision = _revision_token(metadata)
+    if revision and known_revision == revision:
+        return DocumentSnapshot(revision=revision, text=None)
+
+    try:
+        text = _fetch_via_drive_export(
+            drive_service, doc_id, metadata.get("mimeType", "")
+        )
         if text:
-            return text
+            return DocumentSnapshot(revision=revision, text=text)
     except Exception as e:
         print(f"⚠️ Ошибка Drive API для {doc_id}: {e}")
 
     try:
-        return _fetch_via_docs_api(doc_id, credentials)
-    except Exception as e:
+        text = _fetch_via_docs_api(doc_id, credentials)
+        if text:
+            return DocumentSnapshot(revision=revision, text=text)
+    except Exception:
+        pass
+
+    raise ValueError("Документ пуст, закрыт или имеет неподдерживаемый формат")
+
+
+def get_doc_text(doc_url: str) -> str:
+    """Backward-compatible text fetch used by CV analysis endpoints."""
+    try:
+        return get_doc_snapshot(doc_url).text or ""
+    except Exception:
         return ""

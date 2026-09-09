@@ -27,6 +27,10 @@ class Candidate(Base):
     direction = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     embedding = Column(LargeBinary, nullable=True)
+    cv_source_revision = Column(String(128), nullable=True)
+    cv_content_hash = Column(String(64), nullable=True)
+    parsed_content_hash = Column(String(64), nullable=True)
+    parsed_with_version = Column(Integer, nullable=True)
 
     @validates('created_at')
     def validate_created_at(self, key, value):

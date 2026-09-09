@@ -10,6 +10,9 @@ os.environ["DATABASE_URL"] = "sqlite://"
 
 
 class _Expression:
+    def is_(self, _value):
+        return self
+
     def is_not(self, _value):
         return self
 
@@ -19,9 +22,13 @@ class _Expression:
     def __ne__(self, _value):
         return self
 
+    def __eq__(self, _value):
+        return self
+
 
 class _Model:
-    id = name = cv_url = embedding = direction = created_at = department = _Expression()
+    id = name = cv_url = cv_text = embedding = direction = created_at = department = _Expression()
+    cv_content_hash = parsed_content_hash = parsed_with_version = _Expression()
 
 
 database_db = types.ModuleType("database.db")
@@ -80,7 +87,11 @@ embeddings.model = types.SimpleNamespace(encode=lambda blocks: [[0.0] for _ in b
 sys.modules["services.embeddings"] = embeddings
 
 service_stubs = {
-    "services.google_docs": {"get_doc_text": lambda *_: ""},
+    "services.google_docs": {
+        "extract_doc_id": lambda url: "doc-id" if url else None,
+        "get_doc_snapshot": lambda *_: types.SimpleNamespace(revision=None, text=""),
+        "get_doc_text": lambda *_: "",
+    },
     "services.google_sheets": {
         "sync_candidates_from_cloud": lambda *_: {},
         "sync_vacancies_from_cloud": lambda *_args, **_kwargs: {},
