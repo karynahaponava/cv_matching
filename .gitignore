@@ -19,6 +19,7 @@ __pycache__/
 *.sqlite3
 pg_data/
 sync_status.txt
+last_cv_parsing_at.txt
 .DS_Store
 Thumbs.db
 /.idea

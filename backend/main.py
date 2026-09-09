@@ -4,7 +4,7 @@ import hashlib
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import os
 
@@ -53,6 +53,7 @@ PARSING_COMMIT_BATCH_SIZE = 100
 INTERRUPTED_SYNC_STATUS = (
     "❌ Предыдущая синхронизация прервана перезапуском сервиса."
 )
+LAST_CV_PARSING_FILE = "last_cv_parsing_at.txt"
 
 
 class PaginationRequest(BaseModel):
@@ -173,6 +174,22 @@ def update_status(text: str):
     """Helper function for writing the current status to a file"""
     with open("sync_status.txt", "w", encoding="utf-8") as f:
         f.write(text)
+
+
+def record_last_cv_parsing_at() -> str:
+    """Persist the UTC completion time of the latest successful parsing run."""
+    parsed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with open(LAST_CV_PARSING_FILE, "w", encoding="utf-8") as timestamp_file:
+        timestamp_file.write(parsed_at)
+    return parsed_at
+
+
+def get_last_cv_parsing_at() -> str | None:
+    try:
+        with open(LAST_CV_PARSING_FILE, "r", encoding="utf-8") as timestamp_file:
+            return timestamp_file.read().strip() or None
+    except FileNotFoundError:
+        return None
 
 
 def _status_looks_running(status: str) -> bool:
@@ -441,6 +458,7 @@ async def process_cvs_in_background(days_limit: int = None):
         res_stack = await asyncio.to_thread(
             internal_parse_cv_stacks, days_limit=days_limit
         )
+        record_last_cv_parsing_at()
 
         update_status(
             f"Шаг 4: Расчет ИИ-векторов для семантического поиска {mode_text}..."
@@ -689,7 +707,9 @@ def parse_cv_stacks(
 ):
     acquire_sync_lock()
     try:
-        return internal_parse_cv_stacks(days_limit=days_limit, force=force)
+        result = internal_parse_cv_stacks(days_limit=days_limit, force=force)
+        record_last_cv_parsing_at()
+        return result
     finally:
         _sync_lock.release()
 
@@ -864,13 +884,23 @@ def search(
 @app.get("/sync-status", responses=ERROR_RESPONSES)
 def get_sync_status():
     try:
+        last_parsed_at = get_last_cv_parsing_at()
         recovered_status = recover_stale_sync_status()
         if recovered_status is not None:
-            return {"status": recovered_status}
+            return {
+                "status": recovered_status,
+                "last_parsed_at": last_parsed_at,
+            }
         if os.path.exists("sync_status.txt"):
             with open("sync_status.txt", "r", encoding="utf-8") as f:
-                return {"status": f.read()}
-        return {"status": "Синхронизация еще не запускалась"}
+                return {
+                    "status": f.read(),
+                    "last_parsed_at": last_parsed_at,
+                }
+        return {
+            "status": "Синхронизация еще не запускалась",
+            "last_parsed_at": last_parsed_at,
+        }
     except OSError as exc:
         raise ApiError(
             500,

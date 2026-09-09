@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -245,7 +246,10 @@ def test_stale_running_sync_status_is_marked_interrupted(monkeypatch, tmp_path):
 
     response = main.get_sync_status()
 
-    assert response == {"status": main.INTERRUPTED_SYNC_STATUS}
+    assert response == {
+        "status": main.INTERRUPTED_SYNC_STATUS,
+        "last_parsed_at": None,
+    }
     assert status_file.read_text(encoding="utf-8") == main.INTERRUPTED_SYNC_STATUS
 
 
@@ -488,8 +492,9 @@ def test_parser_commits_in_batches(monkeypatch):
     assert session.commits == 2
 
 
-def test_parse_endpoint_forwards_force_and_releases_lock(monkeypatch):
+def test_parse_endpoint_forwards_force_and_releases_lock(monkeypatch, tmp_path):
     captured = {}
+    monkeypatch.chdir(tmp_path)
 
     def parse(days_limit=None, force=False):
         captured.update(days_limit=days_limit, force=force)
@@ -499,7 +504,24 @@ def test_parse_endpoint_forwards_force_and_releases_lock(monkeypatch):
 
     assert main.parse_cv_stacks(days_limit=7, force=True) == {"updated": 0}
     assert captured == {"days_limit": 7, "force": True}
+    saved_timestamp = (tmp_path / main.LAST_CV_PARSING_FILE).read_text()
+    parsed_timestamp = datetime.fromisoformat(saved_timestamp.replace("Z", "+00:00"))
+    assert parsed_timestamp.utcoffset().total_seconds() == 0
     assert not main._sync_lock.locked()
+
+
+def test_sync_status_returns_last_parsing_timestamp(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    completed_status = "Синхронизация полностью завершена"
+    Path("sync_status.txt").write_text(completed_status, encoding="utf-8")
+    Path(main.LAST_CV_PARSING_FILE).write_text(
+        "2026-09-09T09:30:00Z", encoding="utf-8"
+    )
+
+    assert main.get_sync_status() == {
+        "status": completed_status,
+        "last_parsed_at": "2026-09-09T09:30:00Z",
+    }
 
 
 def test_nightly_job_checks_all_cv_revisions(monkeypatch):
