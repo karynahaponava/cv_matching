@@ -195,6 +195,7 @@ def _install_main_import_stubs() -> None:
         TelegramVacancy=FakeModel,
         TelegramChannelState=FakeModel,
         MaintenanceState=FakeModel,
+        SyncStatus=FakeModel,
     )
 
     _module("services").__path__ = []
@@ -242,7 +243,18 @@ def api_module():
 
 @pytest.fixture()
 def client(api_module, monkeypatch):
-    monkeypatch.setattr(api_module, "update_status", lambda text: None)
+    monkeypatch.setattr(api_module, "start_sync_status", lambda text, **kwargs: "run-id")
+    monkeypatch.setattr(api_module, "update_status", lambda text, run_id, **kwargs: None)
+    monkeypatch.setattr(
+        api_module,
+        "read_sync_status",
+        lambda: {
+            "run_id": None,
+            "state": "idle",
+            "message": "Синхронизация еще не запускалась",
+            "updated_at": None,
+        },
+    )
     monkeypatch.setattr(api_module.os.path, "exists", lambda path: False)
     test_client = TestClient(api_module.app, raise_server_exceptions=False)
     yield test_client

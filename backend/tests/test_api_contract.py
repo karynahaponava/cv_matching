@@ -1,7 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from pathlib import Path
 
 import pytest
 from fastapi import BackgroundTasks
@@ -236,49 +235,159 @@ def test_maintenance_lock_released_when_session_creation_fails(monkeypatch, oper
     assert not main._sync_lock.locked()
 
 
-def test_stale_running_sync_status_is_marked_interrupted(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    status_file = Path("sync_status.txt")
-    status_file.write_text(
-        "Шаг 2: Скачивание текстов резюме для ВСЕЙ базы...",
-        encoding="utf-8",
+class SyncStatusSession:
+    def __init__(self, row=None):
+        self.row = row
+        self.filters = {}
+        self.commits = 0
+
+    def get(self, _model, row_id):
+        if self.row is not None and self.row.id == row_id:
+            return self.row
+        return None
+
+    def add(self, row):
+        self.row = row
+
+    def query(self, _model):
+        return self
+
+    def filter_by(self, **values):
+        self.filters = values
+        return self
+
+    def update(self, values, synchronize_session=False):
+        del synchronize_session
+        if self.row is None or any(
+            getattr(self.row, key) != value for key, value in self.filters.items()
+        ):
+            return 0
+        for key, value in values.items():
+            setattr(self.row, key, value)
+        return 1
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def make_sync_status(state, message, run_id="current-run"):
+    return SimpleNamespace(
+        id=main.SYNC_STATUS_ROW_ID,
+        run_id=run_id,
+        state=state,
+        message=message,
+        updated_at=datetime.now().astimezone(),
     )
 
+
+def test_stale_running_sync_status_is_marked_interrupted(monkeypatch):
+    session = SyncStatusSession(
+        make_sync_status(main.SYNC_STATE_RUNNING, "Шаг 2: Проверка CV...")
+    )
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(main, "get_last_cv_parsing_at", lambda: None)
+
+    assert main.recover_stale_sync_status() == main.INTERRUPTED_SYNC_STATUS
     response = main.get_sync_status()
 
-    assert response == {
-        "status": main.INTERRUPTED_SYNC_STATUS,
-        "last_parsed_at": None,
-    }
-    assert status_file.read_text(encoding="utf-8") == main.INTERRUPTED_SYNC_STATUS
+    assert response["status"] == main.INTERRUPTED_SYNC_STATUS
+    assert response["state"] == main.SYNC_STATE_FAILED
+    assert response["run_id"] == "current-run"
+    assert response["last_parsed_at"] is None
 
 
-def test_active_sync_status_is_not_recovered(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    status_file = Path("sync_status.txt")
-    running_status = "Шаг 3: Анализ стека..."
-    status_file.write_text(running_status, encoding="utf-8")
+def test_active_sync_status_is_not_recovered(monkeypatch):
+    session = SyncStatusSession(
+        make_sync_status(main.SYNC_STATE_RUNNING, "Шаг 3: Анализ стека...")
+    )
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
     main._sync_lock.acquire()
 
     assert main.recover_stale_sync_status() is None
-    assert status_file.read_text(encoding="utf-8") == running_status
+    assert session.row.state == main.SYNC_STATE_RUNNING
 
 
 @pytest.mark.parametrize(
-    "terminal_status",
+    ("terminal_state", "terminal_status"),
     [
-        "🎉 Синхронизация полностью завершена!",
-        "❌ Процесс прерван из-за ошибки",
-        "Синхронизация еще не запускалась",
+        (main.SYNC_STATE_COMPLETED, "🎉 Синхронизация полностью завершена!"),
+        (main.SYNC_STATE_FAILED, "❌ Процесс прерван из-за ошибки"),
     ],
 )
-def test_terminal_sync_status_is_preserved(monkeypatch, tmp_path, terminal_status):
-    monkeypatch.chdir(tmp_path)
-    status_file = Path("sync_status.txt")
-    status_file.write_text(terminal_status, encoding="utf-8")
+def test_terminal_sync_status_is_preserved(
+    monkeypatch, terminal_state, terminal_status
+):
+    session = SyncStatusSession(make_sync_status(terminal_state, terminal_status))
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
 
     assert main.recover_stale_sync_status() == terminal_status
-    assert status_file.read_text(encoding="utf-8") == terminal_status
+    assert session.row.state == terminal_state
+
+
+def test_old_run_cannot_overwrite_newer_sync_status(monkeypatch):
+    session = SyncStatusSession(
+        make_sync_status(main.SYNC_STATE_RUNNING, "Новый запуск", run_id="new-run")
+    )
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+
+    assert not main.update_status(
+        "Старая ошибка", "old-run", state=main.SYNC_STATE_FAILED
+    )
+    assert session.row.message == "Новый запуск"
+    assert session.row.state == main.SYNC_STATE_RUNNING
+
+
+def test_background_sync_finishes_current_run_as_completed(monkeypatch):
+    updates = []
+
+    async def update_cvs(days_limit=None):
+        return {"updated": 0}
+
+    monkeypatch.setattr(main, "internal_update_cv_texts", update_cvs)
+    monkeypatch.setattr(main, "internal_parse_cv_stacks", lambda **kwargs: {"updated": 0})
+    monkeypatch.setattr(main, "internal_build_embeddings", lambda **kwargs: {"updated": 0})
+    monkeypatch.setattr(main, "record_last_cv_parsing_at", lambda: None)
+    monkeypatch.setattr(
+        main,
+        "update_status",
+        lambda text, run_id, state=main.SYNC_STATE_RUNNING: updates.append(
+            (text, run_id, state)
+        )
+        or True,
+    )
+
+    asyncio.run(main.process_cvs_in_background(run_id="run-id"))
+
+    assert updates[-1][1:] == ("run-id", main.SYNC_STATE_COMPLETED)
+
+
+def test_background_sync_marks_current_run_failed(monkeypatch):
+    updates = []
+
+    async def fail_update(days_limit=None):
+        raise RuntimeError("drive unavailable")
+
+    monkeypatch.setattr(main, "internal_update_cv_texts", fail_update)
+    monkeypatch.setattr(main.traceback, "print_exc", lambda: None)
+    monkeypatch.setattr(
+        main,
+        "update_status",
+        lambda text, run_id, state=main.SYNC_STATE_RUNNING: updates.append(
+            (text, run_id, state)
+        )
+        or True,
+    )
+
+    asyncio.run(main.process_cvs_in_background(run_id="run-id"))
+
+    assert "drive unavailable" in updates[-1][0]
+    assert updates[-1][1:] == ("run-id", main.SYNC_STATE_FAILED)
 
 
 class MaintenanceSession:
@@ -564,18 +673,23 @@ def test_parse_endpoint_forwards_force_and_releases_lock(monkeypatch):
     assert not main._sync_lock.locked()
 
 
-def test_sync_status_returns_last_parsing_timestamp(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
+def test_sync_status_returns_structured_state_and_last_parsing_timestamp(monkeypatch):
     completed_status = "Синхронизация полностью завершена"
-    Path("sync_status.txt").write_text(completed_status, encoding="utf-8")
+    session = SyncStatusSession(
+        make_sync_status(main.SYNC_STATE_COMPLETED, completed_status)
+    )
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
     monkeypatch.setattr(
         main, "get_last_cv_parsing_at", lambda: "2026-09-09T09:30:00Z"
     )
 
-    assert main.get_sync_status() == {
-        "status": completed_status,
-        "last_parsed_at": "2026-09-09T09:30:00Z",
-    }
+    response = main.get_sync_status()
+
+    assert response["status"] == completed_status
+    assert response["state"] == main.SYNC_STATE_COMPLETED
+    assert response["run_id"] == "current-run"
+    assert response["updated_at"] is not None
+    assert response["last_parsed_at"] == "2026-09-09T09:30:00Z"
 
 
 class MaintenanceStateSession:
@@ -631,12 +745,14 @@ def test_nightly_job_checks_all_cv_revisions(monkeypatch):
     monkeypatch.setattr(main, "SessionLocal", lambda: session)
     monkeypatch.setattr(main, "sync_candidates_from_cloud", lambda _session: {})
 
-    async def process(days_limit=None):
-        captured.append(days_limit)
+    async def process(days_limit=None, run_id=None):
+        captured.append((days_limit, run_id))
 
     monkeypatch.setattr(main, "process_cvs_in_background", process)
 
     main.nightly_maintenance_job()
 
-    assert captured == [None]
+    assert len(captured) == 1
+    assert captured[0][0] is None
+    assert captured[0][1]
     assert not main._sync_lock.locked()

@@ -24,30 +24,31 @@ def _api_post(
     return requests.post(f"{API_BASE}{path}", json=payload, timeout=timeout_s)
 
 
-def _get_sync_status() -> tuple[str | None, str | None, str | None]:
+def _get_sync_status() -> tuple[str | None, str | None, str | None, str | None]:
     """Return the current backend sync status or a user-facing error."""
     try:
         response = _api_get("/sync-status")
         if not response.ok:
-            return None, None, api_error_message(
+            return None, None, None, api_error_message(
                 response,
                 "Не удалось получить статус синхронизации",
             )
 
         payload = response.json()
         if not isinstance(payload, dict):
-            return None, None, "Сервер вернул некорректный статус синхронизации."
+            return None, None, None, "Сервер вернул некорректный статус синхронизации."
 
         status = str(payload.get("status", "")).strip()
         if not status:
-            return None, None, "Сервер вернул пустой статус синхронизации."
+            return None, None, None, "Сервер вернул пустой статус синхронизации."
 
+        state = str(payload.get("state", "")).strip() or None
         last_parsed_at = payload.get("last_parsed_at")
         if last_parsed_at is not None:
             last_parsed_at = str(last_parsed_at).strip() or None
-        return status, last_parsed_at, None
+        return status, state, last_parsed_at, None
     except (requests.RequestException, ValueError) as exc:
-        return None, None, f"Не удалось получить статус с сервера: {exc}"
+        return None, None, None, f"Не удалось получить статус с сервера: {exc}"
 
 
 def _classify_sync_status(status: str) -> str:
@@ -77,8 +78,12 @@ def _format_last_parsed_at(last_parsed_at: str | None) -> str:
         return "время недоступно"
 
 
-def _render_sync_status(status: str, last_parsed_at: str | None = None) -> None:
-    state = _classify_sync_status(status)
+def _render_sync_status(
+    status: str,
+    last_parsed_at: str | None = None,
+    state: str | None = None,
+) -> None:
+    state = state or _classify_sync_status(status)
 
     if state == "idle":
         st.caption(status)
@@ -261,10 +266,10 @@ _fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment"
 
 @_fragment(run_every="3s")
 def _render_sync_controls():
-    current_status, last_parsed_at, status_error = _get_sync_status()
+    current_status, current_state, last_parsed_at, status_error = _get_sync_status()
     sync_is_running = (
         current_status is not None
-        and _classify_sync_status(current_status) == "running"
+        and (current_state or _classify_sync_status(current_status)) == "running"
     )
 
     sync_requested = st.button(
@@ -296,7 +301,7 @@ def _render_sync_controls():
     if status_error:
         st.warning(status_error)
     elif current_status is not None:
-        _render_sync_status(current_status, last_parsed_at)
+        _render_sync_status(current_status, last_parsed_at, current_state)
 
 
 with st.sidebar:

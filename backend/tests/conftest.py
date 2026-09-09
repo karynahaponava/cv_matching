@@ -30,6 +30,7 @@ class _Model:
     id = name = cv_url = cv_text = embedding = direction = created_at = department = _Expression()
     cv_content_hash = parsed_content_hash = parsed_with_version = _Expression()
     cv_source_check_failures = cv_source_next_check_at = _Expression()
+    run_id = state = message = updated_at = _Expression()
 
     def __init__(self, **values):
         self.__dict__.update(values)
@@ -47,6 +48,7 @@ for model_name in (
     "TelegramVacancy",
     "TelegramChannelState",
     "MaintenanceState",
+    "SyncStatus",
 ):
     setattr(database_models, model_name, type(model_name, (_Model,), {}))
 sys.modules["database.db"] = database_db

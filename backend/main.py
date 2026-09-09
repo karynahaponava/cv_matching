@@ -3,6 +3,8 @@ import math
 import hashlib
 import threading
 import time
+import traceback
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -25,6 +27,7 @@ from database.db import Base, SessionLocal, engine
 from database.models import (
     Candidate,
     MaintenanceState,
+    SyncStatus,
     Submission,
     Vacancy,
     TelegramVacancy,
@@ -64,6 +67,10 @@ INTERRUPTED_SYNC_STATUS = (
     "❌ Предыдущая синхронизация прервана перезапуском сервиса."
 )
 LAST_CV_PARSING_STATE_KEY = "cv_parsing"
+SYNC_STATUS_ROW_ID = 1
+SYNC_STATE_RUNNING = "running"
+SYNC_STATE_COMPLETED = "completed"
+SYNC_STATE_FAILED = "failed"
 
 
 class PaginationRequest(BaseModel):
@@ -180,10 +187,116 @@ class TGRequest(BaseModel):
     limit: int = 10
 
 
-def update_status(text: str):
-    """Helper function for writing the current status to a file"""
-    with open("sync_status.txt", "w", encoding="utf-8") as f:
-        f.write(text)
+def start_sync_status(text: str, state: str = SYNC_STATE_RUNNING) -> str:
+    """Create a new current run and return the token required to update it."""
+    run_id = uuid.uuid4().hex
+    session = None
+    try:
+        session = SessionLocal()
+        status = session.get(SyncStatus, SYNC_STATUS_ROW_ID)
+        now = datetime.now(timezone.utc)
+        if status is None:
+            status = SyncStatus(
+                id=SYNC_STATUS_ROW_ID,
+                run_id=run_id,
+                state=state,
+                message=text,
+                updated_at=now,
+            )
+            session.add(status)
+        else:
+            status.run_id = run_id
+            status.state = state
+            status.message = text
+            status.updated_at = now
+        session.commit()
+    except Exception as exc:
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        print(f"[Статус синхронизации] Не удалось создать запуск: {exc}")
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"[Статус синхронизации] Не удалось закрыть DB-сессию: {exc}")
+    return run_id
+
+
+def update_status(
+    text: str,
+    run_id: str,
+    state: str = SYNC_STATE_RUNNING,
+) -> bool:
+    """Atomically update status only while this run is still the current one."""
+    session = None
+    try:
+        session = SessionLocal()
+        updated = (
+            session.query(SyncStatus)
+            .filter_by(id=SYNC_STATUS_ROW_ID, run_id=run_id)
+            .update(
+                {
+                    "state": state,
+                    "message": text,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                synchronize_session=False,
+            )
+        )
+        session.commit()
+        if not updated:
+            print(
+                "[Статус синхронизации] Игнорируется обновление устаревшего "
+                f"запуска {run_id}"
+            )
+        return bool(updated)
+    except Exception as exc:
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        print(f"[Статус синхронизации] Не удалось обновить статус: {exc}")
+        return False
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"[Статус синхронизации] Не удалось закрыть DB-сессию: {exc}")
+
+
+def read_sync_status() -> dict:
+    session = SessionLocal()
+    try:
+        status = session.get(SyncStatus, SYNC_STATUS_ROW_ID)
+        if status is None:
+            return {
+                "run_id": None,
+                "state": "idle",
+                "message": "Синхронизация еще не запускалась",
+                "updated_at": None,
+            }
+        updated_at = status.updated_at
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        return {
+            "run_id": status.run_id,
+            "state": status.state,
+            "message": status.message,
+            "updated_at": updated_at.astimezone(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+    finally:
+        try:
+            session.close()
+        except Exception as exc:
+            print(f"[Статус синхронизации] Не удалось закрыть DB-сессию: {exc}")
 
 
 def record_last_cv_parsing_at() -> str | None:
@@ -241,33 +354,22 @@ def get_last_cv_parsing_at() -> str | None:
                 print(f"[Статус parsing] Не удалось закрыть DB-сессию: {exc}")
 
 
-def _status_looks_running(status: str) -> bool:
-    normalized = status.strip().lower().replace("ё", "е")
-    if not normalized:
-        return False
-    terminal_markers = (
-        "завершена",
-        "прерван",
-        "ошибка",
-        "еще не запускалась",
-        "не выполняется",
-    )
-    return not any(marker in normalized for marker in terminal_markers)
-
-
 def recover_stale_sync_status() -> str | None:
-    """Mark a persisted in-progress status as interrupted after process restart."""
-    if _sync_lock.locked() or not os.path.exists("sync_status.txt"):
+    """Mark a DB-backed in-progress run as interrupted after process restart."""
+    if _sync_lock.locked():
         return None
 
     try:
-        with open("sync_status.txt", "r", encoding="utf-8") as status_file:
-            status = status_file.read()
-        if _status_looks_running(status):
-            update_status(INTERRUPTED_SYNC_STATUS)
+        status = read_sync_status()
+        if status["state"] == SYNC_STATE_RUNNING:
+            update_status(
+                INTERRUPTED_SYNC_STATUS,
+                status["run_id"],
+                state=SYNC_STATE_FAILED,
+            )
             return INTERRUPTED_SYNC_STATUS
-        return status
-    except OSError as exc:
+        return status["message"]
+    except Exception as exc:
         print(f"[Статус синхронизации] Не удалось восстановить статус: {exc}")
         return None
 
@@ -547,23 +649,37 @@ def internal_build_embeddings(days_limit: int = None):
         session.close()
 
 
-async def process_cvs_in_background(days_limit: int = None):
+async def process_cvs_in_background(
+    days_limit: int = None,
+    run_id: str | None = None,
+):
     """Incrementally refresh, parse and vectorize CVs."""
+    mode_text = f"за последние {days_limit} дня" if days_limit else "для ВСЕЙ базы"
+    if run_id is None:
+        run_id = start_sync_status(
+            f"Запуск синхронизации ({mode_text}). Шаг 1 завершен."
+        )
     try:
-        mode_text = f"за последние {days_limit} дня" if days_limit else "для ВСЕЙ базы"
-        update_status(f"Запуск синхронизации ({mode_text}). Шаг 1 завершен.")
+        update_status(
+            f"Запуск синхронизации ({mode_text}). Шаг 1 завершен.", run_id
+        )
 
-        update_status(f"Шаг 2: Проверка новых и изменённых резюме {mode_text}...")
+        update_status(
+            f"Шаг 2: Проверка новых и изменённых резюме {mode_text}...", run_id
+        )
         res_cv = await internal_update_cv_texts(days_limit=days_limit)
 
-        update_status(f"Шаг 3: Анализ стека и извлечение направлений {mode_text}...")
+        update_status(
+            f"Шаг 3: Анализ стека и извлечение направлений {mode_text}...", run_id
+        )
         res_stack = await asyncio.to_thread(
             internal_parse_cv_stacks, days_limit=days_limit
         )
         record_last_cv_parsing_at()
 
         update_status(
-            f"Шаг 4: Расчет ИИ-векторов для семантического поиска {mode_text}..."
+            f"Шаг 4: Расчет ИИ-векторов для семантического поиска {mode_text}...",
+            run_id,
         )
         res_ai = await asyncio.to_thread(
             internal_build_embeddings, days_limit=days_limit
@@ -573,15 +689,22 @@ async def process_cvs_in_background(days_limit: int = None):
             "🎉 Синхронизация полностью завершена! "
             f"CV изменено: {res_cv['updated']}; "
             f"распарсено: {res_stack['updated']}; "
-            f"векторов построено: {res_ai['updated']}."
+            f"векторов построено: {res_ai['updated']}.",
+            run_id,
+            state=SYNC_STATE_COMPLETED,
         )
     except Exception as e:
-        update_status(f"❌ Процесс прерван из-за ошибки: {e}")
+        traceback.print_exc()
+        update_status(
+            f"❌ Процесс прерван из-за ошибки: {e}",
+            run_id,
+            state=SYNC_STATE_FAILED,
+        )
 
 
-async def process_manual_sync_in_background():
+async def process_manual_sync_in_background(run_id: str):
     try:
-        await process_cvs_in_background(days_limit=None)
+        await process_cvs_in_background(days_limit=None, run_id=run_id)
     finally:
         _sync_lock.release()
 
@@ -591,9 +714,11 @@ def nightly_maintenance_job():
     if not _sync_lock.acquire(blocking=False):
         message = "Ночная синхронизация пропущена: другая синхронизация уже выполняется"
         print(f"[Ночная синхронизация] {message}")
-        update_status(message)
         return
 
+    run_id = start_sync_status(
+        "Шаг 1: Загрузка данных из Google Sheets для ВСЕЙ базы..."
+    )
     try:
         print("\n" + "=" * 50)
         print(
@@ -608,10 +733,17 @@ def nightly_maintenance_job():
             print(f"✅ Excel синхронизирован: {stats}")
         except Exception as e:
             print(f"❌ Ошибка Excel: {e}")
+            traceback.print_exc()
+            update_status(
+                f"❌ Ночная синхронизация прервана из-за ошибки Excel: {e}",
+                run_id,
+                state=SYNC_STATE_FAILED,
+            )
+            return
         finally:
             session.close()
 
-        asyncio.run(process_cvs_in_background(days_limit=None))
+        asyncio.run(process_cvs_in_background(days_limit=None, run_id=run_id))
         print("\n" + "=" * 50 + "\n")
     finally:
         _sync_lock.release()
@@ -710,8 +842,8 @@ def scheduled_tg_parsing_job():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    recover_stale_sync_status()
     Base.metadata.create_all(bind=engine)
+    recover_stale_sync_status()
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         nightly_maintenance_job, "cron", hour=1, minute=0, misfire_grace_time=3600
@@ -744,15 +876,17 @@ def sync_excel(background_tasks: BackgroundTasks):
 
     session = None
     lock_handed_off = False
+    run_id = start_sync_status(
+        "Шаг 1: Загрузка данных из Google Sheets для ВСЕЙ базы..."
+    )
     try:
         session = SessionLocal()
-        update_status("Шаг 1: Загрузка данных из Google Sheets для ВСЕЙ базы...")
         print("\n" + "=" * 60)
         print("[Ручной запуск] Шаг 1: Скачивание всей таблицы из Google Sheets...")
         stats = sync_candidates_from_cloud(session)
         print(f"✅ Шаг 1 завершен. Статистика: {stats}")
 
-        background_tasks.add_task(process_manual_sync_in_background)
+        background_tasks.add_task(process_manual_sync_in_background, run_id)
         lock_handed_off = True
 
         return {
@@ -762,7 +896,11 @@ def sync_excel(background_tasks: BackgroundTasks):
     except (TimeoutError, asyncio.TimeoutError, requests.Timeout) as exc:
         if session is not None:
             session.rollback()
-        update_status("❌ Синхронизация прервана из-за таймаута внешнего сервиса")
+        update_status(
+            "❌ Синхронизация прервана из-за таймаута внешнего сервиса",
+            run_id,
+            state=SYNC_STATE_FAILED,
+        )
         raise external_service_error(
             exc,
             code="SYNC_FAILED",
@@ -771,7 +909,11 @@ def sync_excel(background_tasks: BackgroundTasks):
     except GoogleHttpError as exc:
         if session is not None:
             session.rollback()
-        update_status("❌ Синхронизация прервана из-за ошибки внешнего сервиса")
+        update_status(
+            "❌ Синхронизация прервана из-за ошибки внешнего сервиса",
+            run_id,
+            state=SYNC_STATE_FAILED,
+        )
         raise external_service_error(
             exc,
             code="SYNC_FAILED",
@@ -780,7 +922,12 @@ def sync_excel(background_tasks: BackgroundTasks):
     except Exception as exc:
         if session is not None:
             session.rollback()
-        update_status("❌ Синхронизация прервана из-за внутренней ошибки")
+        traceback.print_exc()
+        update_status(
+            "❌ Синхронизация прервана из-за внутренней ошибки",
+            run_id,
+            state=SYNC_STATE_FAILED,
+        )
         raise ApiError(
             500,
             "SYNC_FAILED",
@@ -987,23 +1134,15 @@ def search(
 def get_sync_status():
     try:
         last_parsed_at = get_last_cv_parsing_at()
-        recovered_status = recover_stale_sync_status()
-        if recovered_status is not None:
-            return {
-                "status": recovered_status,
-                "last_parsed_at": last_parsed_at,
-            }
-        if os.path.exists("sync_status.txt"):
-            with open("sync_status.txt", "r", encoding="utf-8") as f:
-                return {
-                    "status": f.read(),
-                    "last_parsed_at": last_parsed_at,
-                }
+        status = read_sync_status()
         return {
-            "status": "Синхронизация еще не запускалась",
+            "status": status["message"],
+            "state": status["state"],
+            "run_id": status["run_id"],
+            "updated_at": status["updated_at"],
             "last_parsed_at": last_parsed_at,
         }
-    except OSError as exc:
+    except Exception as exc:
         raise ApiError(
             500,
             "SYNC_STATUS_FAILED",

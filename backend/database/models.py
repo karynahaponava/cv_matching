@@ -48,6 +48,16 @@ class MaintenanceState(Base):
     completed_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class SyncStatus(Base):
+    __tablename__ = "sync_status"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(32), nullable=False, unique=True)
+    state = Column(String(16), nullable=False)
+    message = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class Vacancy(Base):
     __tablename__ = "vacancies"
 
