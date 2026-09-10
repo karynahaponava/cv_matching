@@ -19,9 +19,17 @@ def _api_get(
 
 
 def _api_post(
-    path: str, payload: dict | None = None, timeout_s: int = 2400
+    path: str,
+    payload: dict | None = None,
+    params: dict | None = None,
+    timeout_s: int = 2400,
 ) -> requests.Response:
-    return requests.post(f"{API_BASE}{path}", json=payload, timeout=timeout_s)
+    return requests.post(
+        f"{API_BASE}{path}",
+        json=payload,
+        params=params,
+        timeout=timeout_s,
+    )
 
 
 def _get_sync_status() -> tuple[str | None, str | None, str | None, str | None]:
@@ -272,6 +280,21 @@ def _render_sync_controls():
         and (current_state or _classify_sync_status(current_status)) == "running"
     )
 
+    force_sync = st.checkbox(
+        "Принудительно скачать и перепарсить все CV",
+        value=False,
+        disabled=sync_is_running,
+        help=(
+            "Игнорирует сохранённые revision и backoff. Используйте после изменения "
+            "источников или для полной проверки базы."
+        ),
+    )
+    if force_sync:
+        st.warning(
+            "Будут повторно скачаны и обработаны все доступные CV. "
+            "Операция займёт заметно больше времени."
+        )
+
     sync_requested = st.button(
         "Синхронизация",
         use_container_width=True,
@@ -282,7 +305,7 @@ def _render_sync_controls():
     if sync_requested:
         with st.spinner("Отправка команды на сервер..."):
             try:
-                response = _api_post("/sync-excel")
+                response = _api_post("/sync-excel", params={"force": force_sync})
                 if response.ok:
                     data = response.json()
                     if isinstance(data, dict) and data.get("status") == "success":

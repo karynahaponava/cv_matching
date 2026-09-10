@@ -220,7 +220,7 @@ def test_maintenance_conflict_and_release_after_exception(monkeypatch):
 @pytest.mark.parametrize(
     "operation",
     [
-        lambda: main.sync_excel(BackgroundTasks()),
+        lambda: main.sync_excel(BackgroundTasks(), force=False),
         lambda: main.sync_vacancies(False),
     ],
 )
@@ -233,6 +233,33 @@ def test_maintenance_lock_released_when_session_creation_fails(monkeypatch, oper
     with pytest.raises(ApiError):
         operation()
     assert not main._sync_lock.locked()
+
+
+def test_sync_excel_forwards_force_to_background_pipeline(monkeypatch):
+    captured = {}
+    session = MaintenanceSession([])
+
+    class Tasks:
+        def add_task(self, function, *args):
+            captured.update(function=function, args=args)
+
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(main, "start_sync_status", lambda _text: "run-id")
+    monkeypatch.setattr(
+        main,
+        "sync_candidates_from_cloud",
+        lambda _session: {"added_candidates": 0},
+    )
+
+    response = main.sync_excel(Tasks(), force=True)
+
+    assert response["status"] == "success"
+    assert captured == {
+        "function": main.process_manual_sync_in_background,
+        "args": ("run-id", True),
+    }
+    assert main._sync_lock.locked()
+    main._sync_lock.release()
 
 
 class SyncStatusSession:
@@ -345,12 +372,18 @@ def test_old_run_cannot_overwrite_newer_sync_status(monkeypatch):
 
 def test_background_sync_finishes_current_run_as_completed(monkeypatch):
     updates = []
+    stages = []
 
-    async def update_cvs(days_limit=None):
+    async def update_cvs(days_limit=None, force=False):
+        stages.append(("download", force))
+        return {"updated": 0}
+
+    def parse_cvs(**kwargs):
+        stages.append(("parse", kwargs["force"]))
         return {"updated": 0}
 
     monkeypatch.setattr(main, "internal_update_cv_texts", update_cvs)
-    monkeypatch.setattr(main, "internal_parse_cv_stacks", lambda **kwargs: {"updated": 0})
+    monkeypatch.setattr(main, "internal_parse_cv_stacks", parse_cvs)
     monkeypatch.setattr(main, "internal_build_embeddings", lambda **kwargs: {"updated": 0})
     monkeypatch.setattr(main, "record_last_cv_parsing_at", lambda: None)
     monkeypatch.setattr(
@@ -362,15 +395,16 @@ def test_background_sync_finishes_current_run_as_completed(monkeypatch):
         or True,
     )
 
-    asyncio.run(main.process_cvs_in_background(run_id="run-id"))
+    asyncio.run(main.process_cvs_in_background(run_id="run-id", force=True))
 
+    assert stages == [("download", True), ("parse", True)]
     assert updates[-1][1:] == ("run-id", main.SYNC_STATE_COMPLETED)
 
 
 def test_background_sync_marks_current_run_failed(monkeypatch):
     updates = []
 
-    async def fail_update(days_limit=None):
+    async def fail_update(days_limit=None, force=False):
         raise RuntimeError("drive unavailable")
 
     monkeypatch.setattr(main, "internal_update_cv_texts", fail_update)
@@ -534,6 +568,37 @@ def test_cv_text_sync_skips_candidate_during_backoff(monkeypatch):
     assert result["errors"] == 0
 
 
+def test_forced_cv_text_sync_ignores_revision_and_backoff(monkeypatch):
+    candidate = make_candidate(
+        cv_source_revision="r1",
+        cv_source_check_failures=2,
+        cv_source_next_check_at=datetime.utcnow() + timedelta(hours=1),
+    )
+    session = MaintenanceSession([candidate])
+    snapshot_calls = []
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(main, "extract_doc_id", lambda url: url)
+    monkeypatch.setattr(
+        main,
+        "get_doc_metadata_batch",
+        lambda _urls: [SimpleNamespace(revision="r1", mime_type="", error=None)],
+    )
+
+    def snapshot(url, known_revision, metadata):
+        snapshot_calls.append((url, known_revision, metadata.revision))
+        return SimpleNamespace(revision="r1", text="old text")
+
+    monkeypatch.setattr(main, "get_doc_snapshot", snapshot)
+
+    result = asyncio.run(main.internal_update_cv_texts(force=True))
+
+    assert snapshot_calls == [(candidate.cv_url, None, "r1")]
+    assert result["unchanged"] == 1
+    assert result["skipped"] == 0
+    assert candidate.cv_source_check_failures == 0
+    assert candidate.cv_source_next_check_at is None
+
+
 def test_drive_retry_delay_is_longer_for_permanent_errors():
     transient = RuntimeError("connection refused")
     permanent = RuntimeError("not found")
@@ -670,6 +735,22 @@ def test_parse_endpoint_forwards_force_and_releases_lock(monkeypatch):
     assert main.parse_cv_stacks(days_limit=7, force=True) == {"updated": 0}
     assert captured == {"days_limit": 7, "force": True}
     assert recorded == [True]
+    assert not main._sync_lock.locked()
+
+
+def test_update_cv_texts_endpoint_forwards_force_and_releases_lock(monkeypatch):
+    captured = {}
+
+    async def update(days_limit=None, force=False):
+        captured.update(days_limit=days_limit, force=force)
+        return {"updated": 0}
+
+    monkeypatch.setattr(main, "internal_update_cv_texts", update)
+
+    result = asyncio.run(main.update_cv_texts(days_limit=7, force=True))
+
+    assert result == {"updated": 0}
+    assert captured == {"days_limit": 7, "force": True}
     assert not main._sync_lock.locked()
 
 

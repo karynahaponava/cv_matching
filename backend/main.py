@@ -411,8 +411,11 @@ def drive_retry_delay(error: Exception, failure_count: int) -> timedelta:
     return timedelta(seconds=delay_seconds)
 
 
-async def internal_update_cv_texts(days_limit: int = None):
-    """Check Drive revisions and download only new or changed resume texts."""
+async def internal_update_cv_texts(
+    days_limit: int = None,
+    force: bool = False,
+):
+    """Check revisions, or download every selected CV when force is enabled."""
     session = SessionLocal()
     started_at = time.monotonic()
     stats = {
@@ -443,10 +446,13 @@ async def internal_update_cv_texts(days_limit: int = None):
         semaphore = asyncio.Semaphore(5)
 
         async def fetch_candidate(i, cand, metadata):
-            known_revision = cand.cv_source_revision if cand.cv_content_hash else None
+            known_revision = (
+                cand.cv_source_revision if cand.cv_content_hash and not force else None
+            )
             try:
                 if (
-                    metadata.error is None
+                    not force
+                    and metadata.error is None
                     and metadata.revision
                     and metadata.revision == known_revision
                 ):
@@ -510,7 +516,8 @@ async def internal_update_cv_texts(days_limit: int = None):
                     stats["skipped"] += 1
                     continue
                 if (
-                    cand.cv_source_next_check_at is not None
+                    not force
+                    and cand.cv_source_next_check_at is not None
                     and cand.cv_source_next_check_at > now
                 ):
                     stats["skipped"] += 1
@@ -533,7 +540,10 @@ async def internal_update_cv_texts(days_limit: int = None):
             session.commit()
 
         duration = time.monotonic() - started_at
-        print(f"[Синхронизация CV] {stats}; duration={duration:.2f}s")
+        print(
+            f"[Синхронизация CV] {stats}; force={force}; "
+            f"duration={duration:.2f}s"
+        )
         return stats
 
     finally:
@@ -652,9 +662,20 @@ def internal_build_embeddings(days_limit: int = None):
 async def process_cvs_in_background(
     days_limit: int = None,
     run_id: str | None = None,
+    force: bool = False,
 ):
-    """Incrementally refresh, parse and vectorize CVs."""
+    """Refresh, parse and vectorize CVs incrementally or forcibly end-to-end."""
     mode_text = f"за последние {days_limit} дня" if days_limit else "для ВСЕЙ базы"
+    download_step = (
+        f"Шаг 2: Принудительное скачивание всех резюме {mode_text}..."
+        if force
+        else f"Шаг 2: Проверка новых и изменённых резюме {mode_text}..."
+    )
+    parsing_step = (
+        f"Шаг 3: Принудительный анализ стека всех резюме {mode_text}..."
+        if force
+        else f"Шаг 3: Анализ стека изменённых резюме {mode_text}..."
+    )
     if run_id is None:
         run_id = start_sync_status(
             f"Запуск синхронизации ({mode_text}). Шаг 1 завершен."
@@ -664,16 +685,17 @@ async def process_cvs_in_background(
             f"Запуск синхронизации ({mode_text}). Шаг 1 завершен.", run_id
         )
 
-        update_status(
-            f"Шаг 2: Проверка новых и изменённых резюме {mode_text}...", run_id
+        update_status(download_step, run_id)
+        res_cv = await internal_update_cv_texts(
+            days_limit=days_limit,
+            force=force,
         )
-        res_cv = await internal_update_cv_texts(days_limit=days_limit)
 
-        update_status(
-            f"Шаг 3: Анализ стека и извлечение направлений {mode_text}...", run_id
-        )
+        update_status(parsing_step, run_id)
         res_stack = await asyncio.to_thread(
-            internal_parse_cv_stacks, days_limit=days_limit
+            internal_parse_cv_stacks,
+            days_limit=days_limit,
+            force=force,
         )
         record_last_cv_parsing_at()
 
@@ -702,9 +724,13 @@ async def process_cvs_in_background(
         )
 
 
-async def process_manual_sync_in_background(run_id: str):
+async def process_manual_sync_in_background(run_id: str, force: bool = False):
     try:
-        await process_cvs_in_background(days_limit=None, run_id=run_id)
+        await process_cvs_in_background(
+            days_limit=None,
+            run_id=run_id,
+            force=force,
+        )
     finally:
         _sync_lock.release()
 
@@ -871,7 +897,13 @@ def root():
 
 
 @app.post("/sync-excel", responses=ERROR_RESPONSES)
-def sync_excel(background_tasks: BackgroundTasks):
+def sync_excel(
+    background_tasks: BackgroundTasks,
+    force: bool = Query(
+        False,
+        description="Скачать и перепарсить все CV, игнорируя revision и backoff",
+    ),
+):
     acquire_sync_lock()
 
     session = None
@@ -886,12 +918,23 @@ def sync_excel(background_tasks: BackgroundTasks):
         stats = sync_candidates_from_cloud(session)
         print(f"✅ Шаг 1 завершен. Статистика: {stats}")
 
-        background_tasks.add_task(process_manual_sync_in_background, run_id)
+        background_tasks.add_task(process_manual_sync_in_background, run_id, force)
         lock_handed_off = True
+        pipeline_message = (
+            "Полное скачивание и перепарсинг CV запущены!"
+            if force
+            else (
+                "Проверка изменений CV, инкрементальный parsing и расчет "
+                "ИИ-векторов запущены!"
+            )
+        )
 
         return {
             "status": "success",
-            "message": f"Таблица успешно загружена (Новых: {stats.get('added_candidates', 0)}). Проверка изменений CV, инкрементальный parsing и расчет ИИ-векторов запущены!",
+            "message": (
+                f"Таблица успешно загружена (Новых: {stats.get('added_candidates', 0)}). "
+                f"{pipeline_message}"
+            ),
         }
     except (TimeoutError, asyncio.TimeoutError, requests.Timeout) as exc:
         if session is not None:
@@ -941,10 +984,16 @@ def sync_excel(background_tasks: BackgroundTasks):
 
 
 @app.post("/update-cv-texts", responses=ERROR_RESPONSES)
-async def update_cv_texts(days_limit: int = Query(None)):
+async def update_cv_texts(
+    days_limit: int = Query(None),
+    force: bool = Query(
+        False,
+        description="Скачать все CV, игнорируя revision и backoff",
+    ),
+):
     acquire_sync_lock()
     try:
-        return await internal_update_cv_texts(days_limit=days_limit)
+        return await internal_update_cv_texts(days_limit=days_limit, force=force)
     finally:
         _sync_lock.release()
 
