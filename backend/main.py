@@ -480,7 +480,7 @@ async def internal_update_cv_texts(
                     raise ValueError("Документ не содержит текста")
 
                 new_hash = cv_content_hash(normalized_text)
-                if new_hash == cand.cv_content_hash:
+                if new_hash == cand.cv_content_hash and not force:
                     if snapshot.revision is not None:
                         cand.cv_source_revision = snapshot.revision
                     stats["unchanged"] += 1
@@ -622,18 +622,22 @@ def internal_parse_cv_stacks(days_limit: int = None, force: bool = False):
         session.close()
 
 
-def internal_build_embeddings(days_limit: int = None):
-    """Generate vectors only for successfully parsed current CV content."""
+def internal_build_embeddings(
+    days_limit: int = None,
+    force: bool = False,
+):
+    """Generate missing vectors, or rebuild all current vectors when forced."""
     session = SessionLocal()
     started_at = time.monotonic()
     stats = {"checked": 0, "updated": 0, "unchanged": 0, "skipped": 0, "errors": 0}
     try:
         query = session.query(Candidate).filter(
-            Candidate.embedding.is_(None),
             Candidate.cv_content_hash.is_not(None),
             Candidate.parsed_content_hash == Candidate.cv_content_hash,
             Candidate.parsed_with_version == CURRENT_CV_PARSER_VERSION,
         )
+        if not force:
+            query = query.filter(Candidate.embedding.is_(None))
         if days_limit:
             limit_date = datetime.utcnow() - timedelta(days=days_limit)
             query = query.filter(Candidate.created_at >= limit_date)
@@ -653,7 +657,9 @@ def internal_build_embeddings(days_limit: int = None):
                 stats["skipped"] += 1
         session.commit()
         duration = time.monotonic() - started_at
-        print(f"[Embeddings CV] {stats}; duration={duration:.2f}s")
+        print(
+            f"[Embeddings CV] {stats}; force={force}; duration={duration:.2f}s"
+        )
         return stats
     finally:
         session.close()
@@ -704,7 +710,9 @@ async def process_cvs_in_background(
             run_id,
         )
         res_ai = await asyncio.to_thread(
-            internal_build_embeddings, days_limit=days_limit
+            internal_build_embeddings,
+            days_limit=days_limit,
+            force=force,
         )
 
         update_status(
@@ -1016,11 +1024,15 @@ def parse_cv_stacks(
 def build_embeddings(
     days_limit: int = Query(
         None, description="Лимит дней для генерации эмбеддингов (None = все)"
-    )
+    ),
+    force: bool = Query(
+        False,
+        description="Принудительно пересчитать все актуальные embeddings",
+    ),
 ):
     acquire_sync_lock()
     try:
-        return internal_build_embeddings(days_limit=days_limit)
+        return internal_build_embeddings(days_limit=days_limit, force=force)
     finally:
         _sync_lock.release()
 

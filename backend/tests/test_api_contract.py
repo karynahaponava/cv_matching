@@ -382,9 +382,13 @@ def test_background_sync_finishes_current_run_as_completed(monkeypatch):
         stages.append(("parse", kwargs["force"]))
         return {"updated": 0}
 
+    def build_embeddings(**kwargs):
+        stages.append(("embeddings", kwargs["force"]))
+        return {"updated": 0}
+
     monkeypatch.setattr(main, "internal_update_cv_texts", update_cvs)
     monkeypatch.setattr(main, "internal_parse_cv_stacks", parse_cvs)
-    monkeypatch.setattr(main, "internal_build_embeddings", lambda **kwargs: {"updated": 0})
+    monkeypatch.setattr(main, "internal_build_embeddings", build_embeddings)
     monkeypatch.setattr(main, "record_last_cv_parsing_at", lambda: None)
     monkeypatch.setattr(
         main,
@@ -397,7 +401,11 @@ def test_background_sync_finishes_current_run_as_completed(monkeypatch):
 
     asyncio.run(main.process_cvs_in_background(run_id="run-id", force=True))
 
-    assert stages == [("download", True), ("parse", True)]
+    assert stages == [
+        ("download", True),
+        ("parse", True),
+        ("embeddings", True),
+    ]
     assert updates[-1][1:] == ("run-id", main.SYNC_STATE_COMPLETED)
 
 
@@ -593,8 +601,11 @@ def test_forced_cv_text_sync_ignores_revision_and_backoff(monkeypatch):
     result = asyncio.run(main.internal_update_cv_texts(force=True))
 
     assert snapshot_calls == [(candidate.cv_url, None, "r1")]
-    assert result["unchanged"] == 1
+    assert result["updated"] == 1
+    assert result["unchanged"] == 0
     assert result["skipped"] == 0
+    assert candidate.cv_text == "old text"
+    assert candidate.embedding is None
     assert candidate.cv_source_check_failures == 0
     assert candidate.cv_source_next_check_at is None
 
@@ -696,6 +707,26 @@ def test_embeddings_only_use_successfully_parsed_current_content(monkeypatch):
     assert dirty.embedding is None
 
 
+def test_forced_embeddings_rebuild_existing_current_vector(monkeypatch):
+    candidate = make_candidate(id=1, embedding=b"existing-vector")
+    session = MaintenanceSession([candidate])
+    calls = []
+    monkeypatch.setattr(main, "SessionLocal", lambda: session)
+    monkeypatch.setattr(main, "embed", lambda text: calls.append(text) or [2.0])
+    monkeypatch.setattr(
+        main.np,
+        "array",
+        lambda *_args, **_kwargs: SimpleNamespace(tobytes=lambda: b"new-vector"),
+    )
+
+    result = main.internal_build_embeddings(force=True)
+
+    assert result["checked"] == 1
+    assert result["updated"] == 1
+    assert calls == ["Python\nold text"]
+    assert candidate.embedding == b"new-vector"
+
+
 def test_parser_commits_in_batches(monkeypatch):
     candidates = [
         make_candidate(
@@ -750,6 +781,22 @@ def test_update_cv_texts_endpoint_forwards_force_and_releases_lock(monkeypatch):
     result = asyncio.run(main.update_cv_texts(days_limit=7, force=True))
 
     assert result == {"updated": 0}
+    assert captured == {"days_limit": 7, "force": True}
+    assert not main._sync_lock.locked()
+
+
+def test_build_embeddings_endpoint_forwards_force_and_releases_lock(monkeypatch):
+    captured = {}
+
+    def build(days_limit=None, force=False):
+        captured.update(days_limit=days_limit, force=force)
+        return {"updated": 1}
+
+    monkeypatch.setattr(main, "internal_build_embeddings", build)
+
+    result = main.build_embeddings(days_limit=7, force=True)
+
+    assert result == {"updated": 1}
     assert captured == {"days_limit": 7, "force": True}
     assert not main._sync_lock.locked()
 
