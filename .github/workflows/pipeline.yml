@@ -42,6 +42,7 @@ jobs:
           severity: CRITICAL
           exit-code: "1"
           ignore-unfixed: true
+          timeout: '15m'
       - name: push image to GHCR
         uses: docker/build-push-action@v6
         with:
