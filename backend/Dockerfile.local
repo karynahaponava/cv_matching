@@ -16,12 +16,12 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt requirements-dev.txt ./
 
 RUN python -m pip install --no-cache-dir \
         'torch==2.10.0+cpu' \
         --index-url https://download.pytorch.org/whl/cpu && \
-    python -m pip install --no-cache-dir -r requirements.txt
+    python -m pip install --no-cache-dir -r requirements-dev.txt
 
 COPY . .
 

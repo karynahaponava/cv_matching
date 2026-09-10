@@ -7,3 +7,4 @@ __pycache__
 *.pyd
 .pytest_cache
 sync_status.txt
+last_cv_parsing_at.txt

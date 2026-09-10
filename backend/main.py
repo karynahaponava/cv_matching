@@ -1,9 +1,12 @@
 import re
 import math
+import hashlib
 import threading
 import time
+import traceback
+import uuid
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import os
 
@@ -23,12 +26,20 @@ from sqlalchemy import func, or_
 from database.db import Base, SessionLocal, engine
 from database.models import (
     Candidate,
+    MaintenanceState,
+    SyncStatus,
     Submission,
     Vacancy,
     TelegramVacancy,
     TelegramChannelState,
 )
-from services.google_docs import get_doc_text
+from services.google_docs import (
+    extract_doc_id,
+    get_doc_metadata_batch,
+    get_doc_snapshot,
+    get_doc_text,
+    is_permanent_drive_error,
+)
 from services.google_sheets import sync_candidates_from_cloud, sync_vacancies_from_cloud
 from services.cv_parser import extract_all_from_text
 from services.fuzzy_search import fuzzy_search_candidates
@@ -46,9 +57,20 @@ from api_errors import (
 _sync_lock = threading.Lock()
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
+CURRENT_CV_PARSER_VERSION = 1
+CV_SYNC_COMMIT_BATCH_SIZE = 100
+PARSING_COMMIT_BATCH_SIZE = 100
+DRIVE_TRANSIENT_BACKOFF_SECONDS = 5 * 60
+DRIVE_PERMANENT_BACKOFF_SECONDS = 24 * 60 * 60
+DRIVE_MAX_BACKOFF_SECONDS = 7 * 24 * 60 * 60
 INTERRUPTED_SYNC_STATUS = (
     "❌ Предыдущая синхронизация прервана перезапуском сервиса."
 )
+LAST_CV_PARSING_STATE_KEY = "cv_parsing"
+SYNC_STATUS_ROW_ID = 1
+SYNC_STATE_RUNNING = "running"
+SYNC_STATE_COMPLETED = "completed"
+SYNC_STATE_FAILED = "failed"
 
 
 class PaginationRequest(BaseModel):
@@ -165,144 +187,463 @@ class TGRequest(BaseModel):
     limit: int = 10
 
 
-def update_status(text: str):
-    """Helper function for writing the current status to a file"""
-    with open("sync_status.txt", "w", encoding="utf-8") as f:
-        f.write(text)
+def start_sync_status(text: str, state: str = SYNC_STATE_RUNNING) -> str:
+    """Create a new current run and return the token required to update it."""
+    run_id = uuid.uuid4().hex
+    session = None
+    try:
+        session = SessionLocal()
+        status = session.get(SyncStatus, SYNC_STATUS_ROW_ID)
+        now = datetime.now(timezone.utc)
+        if status is None:
+            status = SyncStatus(
+                id=SYNC_STATUS_ROW_ID,
+                run_id=run_id,
+                state=state,
+                message=text,
+                updated_at=now,
+            )
+            session.add(status)
+        else:
+            status.run_id = run_id
+            status.state = state
+            status.message = text
+            status.updated_at = now
+        session.commit()
+    except Exception as exc:
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        print(f"[Статус синхронизации] Не удалось создать запуск: {exc}")
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"[Статус синхронизации] Не удалось закрыть DB-сессию: {exc}")
+    return run_id
 
 
-def _status_looks_running(status: str) -> bool:
-    normalized = status.strip().lower().replace("ё", "е")
-    if not normalized:
+def update_status(
+    text: str,
+    run_id: str,
+    state: str = SYNC_STATE_RUNNING,
+) -> bool:
+    """Atomically update status only while this run is still the current one."""
+    session = None
+    try:
+        session = SessionLocal()
+        updated = (
+            session.query(SyncStatus)
+            .filter_by(id=SYNC_STATUS_ROW_ID, run_id=run_id)
+            .update(
+                {
+                    "state": state,
+                    "message": text,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                synchronize_session=False,
+            )
+        )
+        session.commit()
+        if not updated:
+            print(
+                "[Статус синхронизации] Игнорируется обновление устаревшего "
+                f"запуска {run_id}"
+            )
+        return bool(updated)
+    except Exception as exc:
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        print(f"[Статус синхронизации] Не удалось обновить статус: {exc}")
         return False
-    terminal_markers = (
-        "завершена",
-        "прерван",
-        "ошибка",
-        "еще не запускалась",
-        "не выполняется",
-    )
-    return not any(marker in normalized for marker in terminal_markers)
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"[Статус синхронизации] Не удалось закрыть DB-сессию: {exc}")
+
+
+def read_sync_status() -> dict:
+    session = SessionLocal()
+    try:
+        status = session.get(SyncStatus, SYNC_STATUS_ROW_ID)
+        if status is None:
+            return {
+                "run_id": None,
+                "state": "idle",
+                "message": "Синхронизация еще не запускалась",
+                "updated_at": None,
+            }
+        updated_at = status.updated_at
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        return {
+            "run_id": status.run_id,
+            "state": status.state,
+            "message": status.message,
+            "updated_at": updated_at.astimezone(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+    finally:
+        try:
+            session.close()
+        except Exception as exc:
+            print(f"[Статус синхронизации] Не удалось закрыть DB-сессию: {exc}")
+
+
+def record_last_cv_parsing_at() -> str | None:
+    """Persist parsing completion without letting observability break the pipeline."""
+    parsed_at = datetime.now(timezone.utc)
+    session = None
+    try:
+        session = SessionLocal()
+        state = session.get(MaintenanceState, LAST_CV_PARSING_STATE_KEY)
+        if state is None:
+            state = MaintenanceState(
+                name=LAST_CV_PARSING_STATE_KEY,
+                completed_at=parsed_at,
+            )
+            session.add(state)
+        else:
+            state.completed_at = parsed_at
+        session.commit()
+        return parsed_at.isoformat().replace("+00:00", "Z")
+    except Exception as exc:
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        print(f"[Статус parsing] Не удалось сохранить время завершения: {exc}")
+        return None
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"[Статус parsing] Не удалось закрыть DB-сессию: {exc}")
+
+
+def get_last_cv_parsing_at() -> str | None:
+    session = None
+    try:
+        session = SessionLocal()
+        state = session.get(MaintenanceState, LAST_CV_PARSING_STATE_KEY)
+        if state is None:
+            return None
+        parsed_at = state.completed_at
+        if parsed_at.tzinfo is None:
+            parsed_at = parsed_at.replace(tzinfo=timezone.utc)
+        return parsed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception as exc:
+        print(f"[Статус parsing] Не удалось прочитать время завершения: {exc}")
+        return None
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"[Статус parsing] Не удалось закрыть DB-сессию: {exc}")
 
 
 def recover_stale_sync_status() -> str | None:
-    """Mark a persisted in-progress status as interrupted after process restart."""
-    if _sync_lock.locked() or not os.path.exists("sync_status.txt"):
+    """Mark a DB-backed in-progress run as interrupted after process restart."""
+    if _sync_lock.locked():
         return None
 
     try:
-        with open("sync_status.txt", "r", encoding="utf-8") as status_file:
-            status = status_file.read()
-        if _status_looks_running(status):
-            update_status(INTERRUPTED_SYNC_STATUS)
+        status = read_sync_status()
+        if status["state"] == SYNC_STATE_RUNNING:
+            update_status(
+                INTERRUPTED_SYNC_STATUS,
+                status["run_id"],
+                state=SYNC_STATE_FAILED,
+            )
             return INTERRUPTED_SYNC_STATUS
-        return status
-    except OSError as exc:
+        return status["message"]
+    except Exception as exc:
         print(f"[Статус синхронизации] Не удалось восстановить статус: {exc}")
         return None
 
 
-async def internal_update_cv_texts(days_limit: int = None):
-    """Downloading resume texts from Google Docs asynchronously"""
-    session = SessionLocal()
+def normalize_cv_text(text: str) -> str:
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
-    stats = {"updated": 0, "skipped": 0, "errors": 0}
+
+def cv_content_hash(text: str) -> str:
+    return hashlib.sha256(normalize_cv_text(text).encode("utf-8")).hexdigest()
+
+
+def candidate_needs_parsing(candidate) -> bool:
+    return (
+        not candidate.cv_content_hash
+        or candidate.parsed_content_hash != candidate.cv_content_hash
+        or candidate.parsed_with_version != CURRENT_CV_PARSER_VERSION
+    )
+
+
+def candidate_ready_for_embedding(candidate) -> bool:
+    return bool(candidate.cv_content_hash) and (
+        candidate.parsed_content_hash == candidate.cv_content_hash
+        and candidate.parsed_with_version == CURRENT_CV_PARSER_VERSION
+    )
+
+
+def drive_retry_delay(error: Exception, failure_count: int) -> timedelta:
+    """Return exponential retry delay, with a longer pause for 403/404 links."""
+    base_seconds = (
+        DRIVE_PERMANENT_BACKOFF_SECONDS
+        if is_permanent_drive_error(error)
+        else DRIVE_TRANSIENT_BACKOFF_SECONDS
+    )
+    delay_seconds = min(
+        base_seconds * (2 ** min(max(failure_count - 1, 0), 6)),
+        DRIVE_MAX_BACKOFF_SECONDS,
+    )
+    return timedelta(seconds=delay_seconds)
+
+
+async def internal_update_cv_texts(
+    days_limit: int = None,
+    force: bool = False,
+):
+    """Check revisions, or download every selected CV when force is enabled."""
+    session = SessionLocal()
+    started_at = time.monotonic()
+    stats = {
+        "checked": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
 
     try:
-        query = session.query(Candidate).filter(
-            or_(
-                Candidate.cv_text == None,
-                Candidate.cv_text == "",
-                func.length(Candidate.cv_text) < 500,
-            )
-        )
+        query = session.query(Candidate)
         if days_limit:
             limit_date = datetime.utcnow() - timedelta(days=days_limit)
             query = query.filter(Candidate.created_at >= limit_date)
 
         candidates = query.all()
         total = len(candidates)
+        stats["checked"] = total
         print(
-            f"\n[Парсер CV] Найдено {total} кандидатов для загрузки текста (Асинхронно)..."
+            f"\n[Синхронизация CV] Проверка revision для {total} кандидатов..."
         )
 
         if total == 0:
+            print("[Синхронизация CV] Нет кандидатов для проверки.")
             return stats
 
         semaphore = asyncio.Semaphore(5)
 
-        async def fetch_candidate(i, cand):
-            if not cand.cv_url or "docs.google.com" not in cand.cv_url:
-                stats["skipped"] += 1
-                return
+        async def fetch_candidate(i, cand, metadata):
+            known_revision = (
+                cand.cv_source_revision if cand.cv_content_hash and not force else None
+            )
+            try:
+                if (
+                    not force
+                    and metadata.error is None
+                    and metadata.revision
+                    and metadata.revision == known_revision
+                ):
+                    cand.cv_source_check_failures = 0
+                    cand.cv_source_next_check_at = None
+                    stats["unchanged"] += 1
+                    return
 
-            async with semaphore:
-                print(f"[{i}/{total}] Старт скачивания CV для: {cand.name[:20]}...")
-                try:
-                    cv_text = await asyncio.to_thread(get_doc_text, cand.cv_url)
+                async with semaphore:
+                    snapshot = await asyncio.to_thread(
+                        get_doc_snapshot,
+                        cand.cv_url,
+                        known_revision,
+                        metadata,
+                    )
 
-                    if cv_text:
-                        cand.cv_text = cv_text
-                        stats["updated"] += 1
-                        print(f"✅ УСПЕШНО [{cand.name[:20]}]")
-                    else:
-                        stats["errors"] += 1
-                        print(f"❌ ОШИБКА Документ закрыт [{cand.name[:20]}]")
-                except Exception as e:
-                    stats["errors"] += 1
-                    print(f"⚠️ ОШИБКА СЕТИ для [{cand.name[:20]}]: {e}")
+                cand.cv_source_check_failures = 0
+                cand.cv_source_next_check_at = None
+                if snapshot.text is None:
+                    stats["unchanged"] += 1
+                    return
 
-        tasks = [fetch_candidate(i, cand) for i, cand in enumerate(candidates, 1)]
+                normalized_text = normalize_cv_text(snapshot.text)
+                if not normalized_text:
+                    raise ValueError("Документ не содержит текста")
 
-        await asyncio.gather(*tasks)
+                new_hash = cv_content_hash(normalized_text)
+                if new_hash == cand.cv_content_hash and not force:
+                    if snapshot.revision is not None:
+                        cand.cv_source_revision = snapshot.revision
+                    stats["unchanged"] += 1
+                    return
 
-        session.commit()
+                cand.cv_text = normalized_text
+                cand.cv_content_hash = new_hash
+                if snapshot.revision is not None:
+                    cand.cv_source_revision = snapshot.revision
+                cand.embedding = None
+                stats["updated"] += 1
+                print(f"[{i}/{total}] CV изменено: {cand.name[:40]}")
+            except Exception as error:
+                failure_count = (cand.cv_source_check_failures or 0) + 1
+                cand.cv_source_check_failures = failure_count
+                cand.cv_source_next_check_at = datetime.utcnow() + drive_retry_delay(
+                    error, failure_count
+                )
+                stats["errors"] += 1
+                print(
+                    f"[{i}/{total}] Ошибка CV [{cand.name[:40]}]: {error}; "
+                    f"повтор после {cand.cv_source_next_check_at.isoformat()}Z"
+                )
+
+        for batch_start in range(0, total, CV_SYNC_COMMIT_BATCH_SIZE):
+            batch = candidates[
+                batch_start : batch_start + CV_SYNC_COMMIT_BATCH_SIZE
+            ]
+            now = datetime.utcnow()
+            candidates_to_check = []
+            for offset, cand in enumerate(batch, 1):
+                if not extract_doc_id(cand.cv_url):
+                    stats["skipped"] += 1
+                    continue
+                if (
+                    not force
+                    and cand.cv_source_next_check_at is not None
+                    and cand.cv_source_next_check_at > now
+                ):
+                    stats["skipped"] += 1
+                    continue
+                candidates_to_check.append((batch_start + offset, cand))
+
+            metadata_results = []
+            if candidates_to_check:
+                metadata_results = await asyncio.to_thread(
+                    get_doc_metadata_batch,
+                    [cand.cv_url for _, cand in candidates_to_check],
+                )
+            tasks = [
+                fetch_candidate(index, cand, metadata)
+                for (index, cand), metadata in zip(
+                    candidates_to_check, metadata_results, strict=True
+                )
+            ]
+            await asyncio.gather(*tasks)
+            session.commit()
+
+        duration = time.monotonic() - started_at
+        print(
+            f"[Синхронизация CV] {stats}; force={force}; "
+            f"duration={duration:.2f}s"
+        )
         return stats
 
     finally:
         session.close()
 
 
-def internal_parse_cv_stacks(days_limit: int = None):
-    """Parsing stack and directions from texts (optional for the last N days)"""
+def internal_parse_cv_stacks(days_limit: int = None, force: bool = False):
+    """Parse only CVs with changed content or an outdated parser version."""
     session = SessionLocal()
+    started_at = time.monotonic()
+    stats = {
+        "checked": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
     try:
-        query = session.query(Candidate).filter(Candidate.cv_text.is_not(None))
+        eligible_query = session.query(Candidate).filter(
+            Candidate.cv_text.is_not(None), Candidate.cv_text != ""
+        )
         if days_limit:
             limit_date = datetime.utcnow() - timedelta(days=days_limit)
-            query = query.filter(Candidate.created_at >= limit_date)
+            eligible_query = eligible_query.filter(Candidate.created_at >= limit_date)
+
+        stats["checked"] = eligible_query.count()
+        query = eligible_query
+        if not force:
+            query = query.filter(
+                or_(
+                    Candidate.cv_content_hash.is_(None),
+                    Candidate.parsed_content_hash.is_(None),
+                    Candidate.parsed_content_hash != Candidate.cv_content_hash,
+                    Candidate.parsed_with_version.is_(None),
+                    Candidate.parsed_with_version != CURRENT_CV_PARSER_VERSION,
+                )
+            )
 
         candidates = query.all()
-        updated = 0
+        if not force:
+            candidates = [c for c in candidates if candidate_needs_parsing(c)]
+        stats["unchanged"] = stats["checked"] - len(candidates)
         for c in candidates:
-            data = extract_all_from_text(c.cv_text)
+            try:
+                normalized_text = normalize_cv_text(c.cv_text)
+                current_hash = cv_content_hash(normalized_text)
+                data = extract_all_from_text(normalized_text)
+                previous_stack = c.stack
+                content_changed = c.parsed_content_hash != current_hash
 
-            c.stack = data["stack"] or c.stack
-            c.seniority = data["seniority"] or c.seniority
+                c.cv_text = normalized_text
+                c.cv_content_hash = current_hash
+                c.stack = data["stack"] or c.stack
+                c.seniority = data["seniority"] or c.seniority
 
-            if not c.direction or not c.direction.strip():
-                c.direction = data["direction"]
+                if not c.direction or not c.direction.strip():
+                    c.direction = data["direction"]
 
-            updated += 1
+                if content_changed or c.stack != previous_stack:
+                    c.embedding = None
+
+                c.parsed_content_hash = current_hash
+                c.parsed_with_version = CURRENT_CV_PARSER_VERSION
+                stats["updated"] += 1
+                if stats["updated"] % PARSING_COMMIT_BATCH_SIZE == 0:
+                    session.commit()
+            except Exception as exc:
+                stats["errors"] += 1
+                print(f"[Парсер CV] Ошибка для candidate_id={c.id}: {exc}")
 
         session.commit()
-        print(f"[Парсер стека] Стек и роли успешно обновлены для {updated} кандидатов.")
-        return {"updated": updated}
+        duration = time.monotonic() - started_at
+        print(f"[Парсер CV] {stats}; force={force}; duration={duration:.2f}s")
+        return stats
     finally:
         session.close()
 
 
-def internal_build_embeddings(days_limit: int = None):
-    """Generation of AI vectors (optional for the last N days)"""
+def internal_build_embeddings(
+    days_limit: int = None,
+    force: bool = False,
+):
+    """Generate missing vectors, or rebuild all current vectors when forced."""
     session = SessionLocal()
-    stats = {"updated": 0, "errors": 0}
+    started_at = time.monotonic()
+    stats = {"checked": 0, "updated": 0, "unchanged": 0, "skipped": 0, "errors": 0}
     try:
-        query = session.query(Candidate).filter(Candidate.embedding.is_(None))
+        query = session.query(Candidate).filter(
+            Candidate.cv_content_hash.is_not(None),
+            Candidate.parsed_content_hash == Candidate.cv_content_hash,
+            Candidate.parsed_with_version == CURRENT_CV_PARSER_VERSION,
+        )
+        if not force:
+            query = query.filter(Candidate.embedding.is_(None))
         if days_limit:
             limit_date = datetime.utcnow() - timedelta(days=days_limit)
             query = query.filter(Candidate.created_at >= limit_date)
 
-        candidates = query.all()
+        candidates = [c for c in query.all() if candidate_ready_for_embedding(c)]
+        stats["checked"] = len(candidates)
         for c in candidates:
             text = f"{c.stack or ''}\n{c.cv_text or ''}".strip()
             if text:
@@ -312,53 +653,106 @@ def internal_build_embeddings(days_limit: int = None):
                     stats["updated"] += 1
                 except Exception:
                     stats["errors"] += 1
+            else:
+                stats["skipped"] += 1
         session.commit()
+        duration = time.monotonic() - started_at
+        print(
+            f"[Embeddings CV] {stats}; force={force}; duration={duration:.2f}s"
+        )
         return stats
     finally:
         session.close()
 
 
-async def process_cvs_in_background(days_limit: int = None):
-    """Full background word processing, parsing and vectorization process"""
+async def process_cvs_in_background(
+    days_limit: int = None,
+    run_id: str | None = None,
+    force: bool = False,
+):
+    """Refresh, parse and vectorize CVs incrementally or forcibly end-to-end."""
+    mode_text = f"за последние {days_limit} дня" if days_limit else "для ВСЕЙ базы"
+    download_step = (
+        f"Шаг 2: Принудительное скачивание всех резюме {mode_text}..."
+        if force
+        else f"Шаг 2: Проверка новых и изменённых резюме {mode_text}..."
+    )
+    parsing_step = (
+        f"Шаг 3: Принудительный анализ стека всех резюме {mode_text}..."
+        if force
+        else f"Шаг 3: Анализ стека изменённых резюме {mode_text}..."
+    )
+    if run_id is None:
+        run_id = start_sync_status(
+            f"Запуск синхронизации ({mode_text}). Шаг 1 завершен."
+        )
     try:
-        mode_text = f"за последние {days_limit} дня" if days_limit else "для ВСЕЙ базы"
-        update_status(f"Запуск синхронизации ({mode_text}). Шаг 1 завершен.")
+        update_status(
+            f"Запуск синхронизации ({mode_text}). Шаг 1 завершен.", run_id
+        )
 
-        update_status(f"Шаг 2: Скачивание текстов резюме {mode_text}...")
-        res_cv = await internal_update_cv_texts(days_limit=days_limit)
+        update_status(download_step, run_id)
+        res_cv = await internal_update_cv_texts(
+            days_limit=days_limit,
+            force=force,
+        )
 
-        update_status(f"Шаг 3: Анализ стека и извлечение направлений {mode_text}...")
+        update_status(parsing_step, run_id)
         res_stack = await asyncio.to_thread(
-            internal_parse_cv_stacks, days_limit=days_limit
+            internal_parse_cv_stacks,
+            days_limit=days_limit,
+            force=force,
+        )
+        record_last_cv_parsing_at()
+
+        update_status(
+            f"Шаг 4: Расчет ИИ-векторов для семантического поиска {mode_text}...",
+            run_id,
+        )
+        res_ai = await asyncio.to_thread(
+            internal_build_embeddings,
+            days_limit=days_limit,
+            force=force,
         )
 
         update_status(
-            f"Шаг 4: Расчет ИИ-векторов для семантического поиска {mode_text}..."
+            "🎉 Синхронизация полностью завершена! "
+            f"CV изменено: {res_cv['updated']}; "
+            f"распарсено: {res_stack['updated']}; "
+            f"векторов построено: {res_ai['updated']}.",
+            run_id,
+            state=SYNC_STATE_COMPLETED,
         )
-        res_ai = await asyncio.to_thread(
-            internal_build_embeddings, days_limit=days_limit
-        )
-
-        update_status("🎉 Синхронизация полностью завершена! Все данные актуальны.")
     except Exception as e:
-        update_status(f"❌ Процесс прерван из-за ошибки: {e}")
+        traceback.print_exc()
+        update_status(
+            f"❌ Процесс прерван из-за ошибки: {e}",
+            run_id,
+            state=SYNC_STATE_FAILED,
+        )
 
 
-async def process_manual_sync_in_background():
+async def process_manual_sync_in_background(run_id: str, force: bool = False):
     try:
-        await process_cvs_in_background(days_limit=None)
+        await process_cvs_in_background(
+            days_limit=None,
+            run_id=run_id,
+            force=force,
+        )
     finally:
         _sync_lock.release()
 
 
 def nightly_maintenance_job():
-    """Automatic nightly build: Updates the structure COMPLETELY, but only parses the last 2 days"""
+    """Nightly sync checks revisions for all CVs and processes only changes."""
     if not _sync_lock.acquire(blocking=False):
         message = "Ночная синхронизация пропущена: другая синхронизация уже выполняется"
         print(f"[Ночная синхронизация] {message}")
-        update_status(message)
         return
 
+    run_id = start_sync_status(
+        "Шаг 1: Загрузка данных из Google Sheets для ВСЕЙ базы..."
+    )
     try:
         print("\n" + "=" * 50)
         print(
@@ -373,10 +767,17 @@ def nightly_maintenance_job():
             print(f"✅ Excel синхронизирован: {stats}")
         except Exception as e:
             print(f"❌ Ошибка Excel: {e}")
+            traceback.print_exc()
+            update_status(
+                f"❌ Ночная синхронизация прервана из-за ошибки Excel: {e}",
+                run_id,
+                state=SYNC_STATE_FAILED,
+            )
+            return
         finally:
             session.close()
 
-        asyncio.run(process_cvs_in_background(days_limit=2))
+        asyncio.run(process_cvs_in_background(days_limit=None, run_id=run_id))
         print("\n" + "=" * 50 + "\n")
     finally:
         _sync_lock.release()
@@ -475,8 +876,8 @@ def scheduled_tg_parsing_job():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    recover_stale_sync_status()
     Base.metadata.create_all(bind=engine)
+    recover_stale_sync_status()
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         nightly_maintenance_job, "cron", hour=1, minute=0, misfire_grace_time=3600
@@ -488,7 +889,7 @@ async def lifespan(app: FastAPI):
 
     scheduler.start()
     print("⏰ Планировщик запущен! Единая ночная сборка назначена на 01:00.")
-    print("   Правило: Вся таблица Excel ➡️ Дельта за 2 дня (Тексты, Стек, ИИ-векторы)")
+    print("   Правило: вся таблица Excel ➡️ revision-check всех CV ➡️ только изменения")
     yield
     scheduler.shutdown()
     print("⏰ Планировщик задач остановлен.")
@@ -504,30 +905,53 @@ def root():
 
 
 @app.post("/sync-excel", responses=ERROR_RESPONSES)
-def sync_excel(background_tasks: BackgroundTasks):
+def sync_excel(
+    background_tasks: BackgroundTasks,
+    force: bool = Query(
+        False,
+        description="Скачать и перепарсить все CV, игнорируя revision и backoff",
+    ),
+):
     acquire_sync_lock()
 
     session = None
     lock_handed_off = False
+    run_id = start_sync_status(
+        "Шаг 1: Загрузка данных из Google Sheets для ВСЕЙ базы..."
+    )
     try:
         session = SessionLocal()
-        update_status("Шаг 1: Загрузка данных из Google Sheets для ВСЕЙ базы...")
         print("\n" + "=" * 60)
         print("[Ручной запуск] Шаг 1: Скачивание всей таблицы из Google Sheets...")
         stats = sync_candidates_from_cloud(session)
         print(f"✅ Шаг 1 завершен. Статистика: {stats}")
 
-        background_tasks.add_task(process_manual_sync_in_background)
+        background_tasks.add_task(process_manual_sync_in_background, run_id, force)
         lock_handed_off = True
+        pipeline_message = (
+            "Полное скачивание и перепарсинг CV запущены!"
+            if force
+            else (
+                "Проверка изменений CV, инкрементальный parsing и расчет "
+                "ИИ-векторов запущены!"
+            )
+        )
 
         return {
             "status": "success",
-            "message": f"Таблица успешно загружена (Новых: {stats.get('added_candidates', 0)}). Тотальный перепарсинг ВСЕЙ базы и расчет ИИ-векторов запущены!",
+            "message": (
+                f"Таблица успешно загружена (Новых: {stats.get('added_candidates', 0)}). "
+                f"{pipeline_message}"
+            ),
         }
     except (TimeoutError, asyncio.TimeoutError, requests.Timeout) as exc:
         if session is not None:
             session.rollback()
-        update_status("❌ Синхронизация прервана из-за таймаута внешнего сервиса")
+        update_status(
+            "❌ Синхронизация прервана из-за таймаута внешнего сервиса",
+            run_id,
+            state=SYNC_STATE_FAILED,
+        )
         raise external_service_error(
             exc,
             code="SYNC_FAILED",
@@ -536,7 +960,11 @@ def sync_excel(background_tasks: BackgroundTasks):
     except GoogleHttpError as exc:
         if session is not None:
             session.rollback()
-        update_status("❌ Синхронизация прервана из-за ошибки внешнего сервиса")
+        update_status(
+            "❌ Синхронизация прервана из-за ошибки внешнего сервиса",
+            run_id,
+            state=SYNC_STATE_FAILED,
+        )
         raise external_service_error(
             exc,
             code="SYNC_FAILED",
@@ -545,7 +973,12 @@ def sync_excel(background_tasks: BackgroundTasks):
     except Exception as exc:
         if session is not None:
             session.rollback()
-        update_status("❌ Синхронизация прервана из-за внутренней ошибки")
+        traceback.print_exc()
+        update_status(
+            "❌ Синхронизация прервана из-за внутренней ошибки",
+            run_id,
+            state=SYNC_STATE_FAILED,
+        )
         raise ApiError(
             500,
             "SYNC_FAILED",
@@ -559,21 +992,30 @@ def sync_excel(background_tasks: BackgroundTasks):
 
 
 @app.post("/update-cv-texts", responses=ERROR_RESPONSES)
-async def update_cv_texts(days_limit: int = Query(None)):
+async def update_cv_texts(
+    days_limit: int = Query(None),
+    force: bool = Query(
+        False,
+        description="Скачать все CV, игнорируя revision и backoff",
+    ),
+):
     acquire_sync_lock()
     try:
-        return await internal_update_cv_texts(days_limit=days_limit)
+        return await internal_update_cv_texts(days_limit=days_limit, force=force)
     finally:
         _sync_lock.release()
 
 
 @app.post("/parse-cv-stacks", responses=ERROR_RESPONSES)
 def parse_cv_stacks(
-    days_limit: int = Query(None, description="Лимит дней для парсинга (None = все)")
+    days_limit: int = Query(None, description="Лимит дней для парсинга (None = все)"),
+    force: bool = Query(False, description="Принудительно перепарсить все CV"),
 ):
     acquire_sync_lock()
     try:
-        return internal_parse_cv_stacks(days_limit=days_limit)
+        result = internal_parse_cv_stacks(days_limit=days_limit, force=force)
+        record_last_cv_parsing_at()
+        return result
     finally:
         _sync_lock.release()
 
@@ -582,11 +1024,15 @@ def parse_cv_stacks(
 def build_embeddings(
     days_limit: int = Query(
         None, description="Лимит дней для генерации эмбеддингов (None = все)"
-    )
+    ),
+    force: bool = Query(
+        False,
+        description="Принудительно пересчитать все актуальные embeddings",
+    ),
 ):
     acquire_sync_lock()
     try:
-        return internal_build_embeddings(days_limit=days_limit)
+        return internal_build_embeddings(days_limit=days_limit, force=force)
     finally:
         _sync_lock.release()
 
@@ -748,14 +1194,16 @@ def search(
 @app.get("/sync-status", responses=ERROR_RESPONSES)
 def get_sync_status():
     try:
-        recovered_status = recover_stale_sync_status()
-        if recovered_status is not None:
-            return {"status": recovered_status}
-        if os.path.exists("sync_status.txt"):
-            with open("sync_status.txt", "r", encoding="utf-8") as f:
-                return {"status": f.read()}
-        return {"status": "Синхронизация еще не запускалась"}
-    except OSError as exc:
+        last_parsed_at = get_last_cv_parsing_at()
+        status = read_sync_status()
+        return {
+            "status": status["message"],
+            "state": status["state"],
+            "run_id": status["run_id"],
+            "updated_at": status["updated_at"],
+            "last_parsed_at": last_parsed_at,
+        }
+    except Exception as exc:
         raise ApiError(
             500,
             "SYNC_STATUS_FAILED",

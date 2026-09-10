@@ -63,6 +63,11 @@ class FakeModel:
     stack = FakeColumn()
     direction = FakeColumn()
     embedding = FakeColumn()
+    cv_content_hash = FakeColumn()
+    parsed_content_hash = FakeColumn()
+    parsed_with_version = FakeColumn()
+    cv_source_check_failures = FakeColumn()
+    cv_source_next_check_at = FakeColumn()
     created_at = FakeColumn()
     department = FakeColumn()
     candidate_id = FakeColumn()
@@ -189,10 +194,21 @@ def _install_main_import_stubs() -> None:
         Vacancy=FakeModel,
         TelegramVacancy=FakeModel,
         TelegramChannelState=FakeModel,
+        MaintenanceState=FakeModel,
+        SyncStatus=FakeModel,
     )
 
     _module("services").__path__ = []
-    _module("services.google_docs", get_doc_text=lambda url: "")
+    _module(
+        "services.google_docs",
+        extract_doc_id=lambda url: "doc-id" if url else None,
+        get_doc_metadata_batch=lambda urls: [
+            SimpleNamespace(revision=None, mime_type="", error=None) for _ in urls
+        ],
+        get_doc_snapshot=lambda *args: SimpleNamespace(revision=None, text=""),
+        get_doc_text=lambda url: "",
+        is_permanent_drive_error=lambda error: False,
+    )
     _module(
         "services.google_sheets",
         sync_candidates_from_cloud=lambda session: {"added_candidates": 0},
@@ -227,7 +243,18 @@ def api_module():
 
 @pytest.fixture()
 def client(api_module, monkeypatch):
-    monkeypatch.setattr(api_module, "update_status", lambda text: None)
+    monkeypatch.setattr(api_module, "start_sync_status", lambda text, **kwargs: "run-id")
+    monkeypatch.setattr(api_module, "update_status", lambda text, run_id, **kwargs: None)
+    monkeypatch.setattr(
+        api_module,
+        "read_sync_status",
+        lambda: {
+            "run_id": None,
+            "state": "idle",
+            "message": "Синхронизация еще не запускалась",
+            "updated_at": None,
+        },
+    )
     monkeypatch.setattr(api_module.os.path, "exists", lambda path: False)
     test_client = TestClient(api_module.app, raise_server_exceptions=False)
     yield test_client

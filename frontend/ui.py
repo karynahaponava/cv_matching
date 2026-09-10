@@ -1,6 +1,8 @@
 import html
 import os
 import re
+from datetime import datetime, timedelta, timezone
+
 import requests
 import streamlit as st
 from api_client import api_error_message
@@ -17,32 +19,44 @@ def _api_get(
 
 
 def _api_post(
-    path: str, payload: dict | None = None, timeout_s: int = 2400
+    path: str,
+    payload: dict | None = None,
+    params: dict | None = None,
+    timeout_s: int = 2400,
 ) -> requests.Response:
-    return requests.post(f"{API_BASE}{path}", json=payload, timeout=timeout_s)
+    return requests.post(
+        f"{API_BASE}{path}",
+        json=payload,
+        params=params,
+        timeout=timeout_s,
+    )
 
 
-def _get_sync_status() -> tuple[str | None, str | None]:
+def _get_sync_status() -> tuple[str | None, str | None, str | None, str | None]:
     """Return the current backend sync status or a user-facing error."""
     try:
         response = _api_get("/sync-status")
         if not response.ok:
-            return None, api_error_message(
+            return None, None, None, api_error_message(
                 response,
                 "Не удалось получить статус синхронизации",
             )
 
         payload = response.json()
         if not isinstance(payload, dict):
-            return None, "Сервер вернул некорректный статус синхронизации."
+            return None, None, None, "Сервер вернул некорректный статус синхронизации."
 
         status = str(payload.get("status", "")).strip()
         if not status:
-            return None, "Сервер вернул пустой статус синхронизации."
+            return None, None, None, "Сервер вернул пустой статус синхронизации."
 
-        return status, None
+        state = str(payload.get("state", "")).strip() or None
+        last_parsed_at = payload.get("last_parsed_at")
+        if last_parsed_at is not None:
+            last_parsed_at = str(last_parsed_at).strip() or None
+        return status, state, last_parsed_at, None
     except (requests.RequestException, ValueError) as exc:
-        return None, f"Не удалось получить статус с сервера: {exc}"
+        return None, None, None, f"Не удалось получить статус с сервера: {exc}"
 
 
 def _classify_sync_status(status: str) -> str:
@@ -58,8 +72,26 @@ def _classify_sync_status(status: str) -> str:
     return "running"
 
 
-def _render_sync_status(status: str) -> None:
-    state = _classify_sync_status(status)
+def _format_last_parsed_at(last_parsed_at: str | None) -> str:
+    if not last_parsed_at:
+        return "ещё не выполнялось"
+
+    try:
+        parsed_at = datetime.fromisoformat(last_parsed_at.replace("Z", "+00:00"))
+        if parsed_at.tzinfo is None:
+            parsed_at = parsed_at.replace(tzinfo=timezone.utc)
+        utc_plus_3 = timezone(timedelta(hours=3))
+        return parsed_at.astimezone(utc_plus_3).strftime("%d.%m.%Y %H:%M:%S (UTC+3)")
+    except ValueError:
+        return "время недоступно"
+
+
+def _render_sync_status(
+    status: str,
+    last_parsed_at: str | None = None,
+    state: str | None = None,
+) -> None:
+    state = state or _classify_sync_status(status)
 
     if state == "idle":
         st.caption(status)
@@ -69,6 +101,10 @@ def _render_sync_status(status: str) -> None:
         st.error(status)
     else:
         st.info(f"**В процессе:** {status}")
+
+    st.caption(
+        f"Последнее обновление CV (parsing): {_format_last_parsed_at(last_parsed_at)}"
+    )
 
 
 def _extract_keywords(query: str) -> list[str]:
@@ -238,11 +274,26 @@ _fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment"
 
 @_fragment(run_every="3s")
 def _render_sync_controls():
-    current_status, status_error = _get_sync_status()
+    current_status, current_state, last_parsed_at, status_error = _get_sync_status()
     sync_is_running = (
         current_status is not None
-        and _classify_sync_status(current_status) == "running"
+        and (current_state or _classify_sync_status(current_status)) == "running"
     )
+
+    force_sync = st.checkbox(
+        "Принудительно скачать и перепарсить все CV",
+        value=False,
+        disabled=sync_is_running,
+        help=(
+            "Игнорирует сохранённые revision и backoff. Используйте после изменения "
+            "источников или для полной проверки базы."
+        ),
+    )
+    if force_sync:
+        st.warning(
+            "Будут повторно скачаны и обработаны все доступные CV. "
+            "Операция займёт заметно больше времени."
+        )
 
     sync_requested = st.button(
         "Синхронизация",
@@ -254,7 +305,7 @@ def _render_sync_controls():
     if sync_requested:
         with st.spinner("Отправка команды на сервер..."):
             try:
-                response = _api_post("/sync-excel")
+                response = _api_post("/sync-excel", params={"force": force_sync})
                 if response.ok:
                     data = response.json()
                     if isinstance(data, dict) and data.get("status") == "success":
@@ -273,7 +324,7 @@ def _render_sync_controls():
     if status_error:
         st.warning(status_error)
     elif current_status is not None:
-        _render_sync_status(current_status)
+        _render_sync_status(current_status, last_parsed_at, current_state)
 
 
 with st.sidebar:

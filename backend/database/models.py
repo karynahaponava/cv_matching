@@ -27,12 +27,35 @@ class Candidate(Base):
     direction = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     embedding = Column(LargeBinary, nullable=True)
+    cv_source_revision = Column(String(128), nullable=True)
+    cv_content_hash = Column(String(64), nullable=True)
+    parsed_content_hash = Column(String(64), nullable=True)
+    parsed_with_version = Column(Integer, nullable=True)
+    cv_source_check_failures = Column(Integer, nullable=False, default=0)
+    cv_source_next_check_at = Column(DateTime, nullable=True)
 
     @validates('created_at')
     def validate_created_at(self, key, value):
         if value is None or pd.isna(value) or str(value).strip() in ["", "NaT"]:
             return datetime.utcnow()
         return value
+
+
+class MaintenanceState(Base):
+    __tablename__ = "maintenance_state"
+
+    name = Column(String(64), primary_key=True)
+    completed_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class SyncStatus(Base):
+    __tablename__ = "sync_status"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(32), nullable=False, unique=True)
+    state = Column(String(16), nullable=False)
+    message = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
 class Vacancy(Base):

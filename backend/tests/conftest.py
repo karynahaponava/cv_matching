@@ -10,6 +10,9 @@ os.environ["DATABASE_URL"] = "sqlite://"
 
 
 class _Expression:
+    def is_(self, _value):
+        return self
+
     def is_not(self, _value):
         return self
 
@@ -19,9 +22,18 @@ class _Expression:
     def __ne__(self, _value):
         return self
 
+    def __eq__(self, _value):
+        return self
+
 
 class _Model:
-    id = name = cv_url = embedding = direction = created_at = department = _Expression()
+    id = name = cv_url = cv_text = embedding = direction = created_at = department = _Expression()
+    cv_content_hash = parsed_content_hash = parsed_with_version = _Expression()
+    cv_source_check_failures = cv_source_next_check_at = _Expression()
+    run_id = state = message = updated_at = _Expression()
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
 
 
 database_db = types.ModuleType("database.db")
@@ -35,6 +47,8 @@ for model_name in (
     "Vacancy",
     "TelegramVacancy",
     "TelegramChannelState",
+    "MaintenanceState",
+    "SyncStatus",
 ):
     setattr(database_models, model_name, type(model_name, (_Model,), {}))
 sys.modules["database.db"] = database_db
@@ -60,11 +74,6 @@ requests.Timeout = type("Timeout", (requests.RequestException,), {})
 requests.ConnectionError = type("ConnectionError", (requests.RequestException,), {})
 sys.modules["requests"] = requests
 
-google_errors = types.ModuleType("googleapiclient.errors")
-google_errors.HttpError = type("HttpError", (Exception,), {})
-sys.modules["googleapiclient"] = types.ModuleType("googleapiclient")
-sys.modules["googleapiclient.errors"] = google_errors
-
 background = types.ModuleType("apscheduler.schedulers.background")
 background.BackgroundScheduler = type("BackgroundScheduler", (), {})
 sys.modules["apscheduler"] = types.ModuleType("apscheduler")
@@ -80,7 +89,18 @@ embeddings.model = types.SimpleNamespace(encode=lambda blocks: [[0.0] for _ in b
 sys.modules["services.embeddings"] = embeddings
 
 service_stubs = {
-    "services.google_docs": {"get_doc_text": lambda *_: ""},
+    "services.google_docs": {
+        "extract_doc_id": lambda url: "doc-id" if url else None,
+        "get_doc_metadata_batch": lambda urls: [
+            types.SimpleNamespace(revision=None, mime_type="", error=None)
+            for _ in urls
+        ],
+        "get_doc_snapshot": lambda *_: types.SimpleNamespace(revision=None, text=""),
+        "get_doc_text": lambda *_: "",
+        "is_permanent_drive_error": lambda error: getattr(
+            getattr(error, "resp", None), "status", None
+        ) in (403, 404),
+    },
     "services.google_sheets": {
         "sync_candidates_from_cloud": lambda *_: {},
         "sync_vacancies_from_cloud": lambda *_args, **_kwargs: {},
