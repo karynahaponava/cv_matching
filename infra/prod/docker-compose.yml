@@ -1,0 +1,116 @@
+version: "3.8"
+name: cv_matching_prod
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: cv_matching_db_prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}
+      POSTGRES_DB: ${POSTGRES_DB:-cv_matching_prod}
+    networks:
+      - internal_net_prod
+    volumes:
+      - pg_data_prod:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  backend:
+    image: ghcr.io/${REPO_OWNER}/cv_matching-backend:${IMAGE_TAG:-prod}
+    container_name: cv_matching_backend_prod
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - internal_net_prod
+    volumes:
+      - ../../google_creds.json:/app/google_creds.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2G
+        reservations:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  frontend:
+    image: ghcr.io/${REPO_OWNER}/cv_matching-frontend:${IMAGE_TAG:-prod}
+    container_name: cv_matching_frontend_prod
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://backend:8000
+      TG_CHANNELS: ${TG_CHANNELS:-}
+    networks:
+      - internal_net_prod
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+networks:
+  internal_net_prod:
+    external: true
+volumes:
+  pg_data_prod:
