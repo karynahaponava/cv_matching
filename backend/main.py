@@ -171,14 +171,14 @@ class FuzzyMatchRequest(PaginationRequest):
 
 
 class SemanticMatchRequest(PaginationRequest):
-    query: str = Field(min_length=1, max_length=2000)
+    query: str = Field(min_length=1, max_length=20000)
     target_client: str = ""
     target_broker: str = ""
     departments: list[str] = Field(default_factory=list, max_length=10)
 
 
 class AnalyzeRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=2000)
+    query: str = Field(min_length=1, max_length=20000)
     cv_url: str
 
 
@@ -1155,7 +1155,7 @@ def semantic_match(request: SemanticMatchRequest):
 
 @app.get("/search", responses=ERROR_RESPONSES)
 def search(
-    query: str = Query(..., min_length=1, max_length=2000),
+    query: str = Query(..., min_length=1, max_length=20000),
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ):

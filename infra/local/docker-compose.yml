@@ -1,0 +1,67 @@
+version: "3.8"
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}
+      POSTGRES_DB: ${POSTGRES_DB:-cv_matching}
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - internal_net
+    volumes:
+      - pg_data_local:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  backend:
+    image: ghcr.io/${REPO_OWNER}/cv_matching-backend:${IMAGE_TAG:-latest}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-cv_matching}
+    networks:
+      - internal_net
+    volumes:
+      - ../../google_creds.json:/app/google_creds.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+  frontend:
+    image: ghcr.io/${REPO_OWNER}/cv_matching-frontend:${IMAGE_TAG:-latest}
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://backend:8000
+      TG_CHANNELS: ${TG_CHANNELS:-}
+    networks:
+      - internal_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+networks:
+  internal_net:
+    driver: bridge
+volumes:
+  pg_data_local:
