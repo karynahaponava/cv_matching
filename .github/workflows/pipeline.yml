@@ -161,6 +161,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
+          command_timeout: 30m
           script_stop: true
           script: |
             cd /opt/cv_matching/infra/dev
