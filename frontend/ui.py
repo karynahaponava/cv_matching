@@ -242,7 +242,12 @@ st.markdown(
     """
     <style>
         header[data-testid="stHeader"] {
-            position: static !important;
+            background-color: transparent !important;
+        }
+
+        .block-container {
+            padding-top: 2rem !important;
+            padding-bottom: 1rem !important; 
         }
 
         [data-testid="stHorizontalBlock"] {
@@ -267,7 +272,6 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
 
 _fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment")
 
