@@ -342,7 +342,7 @@ with st.sidebar:
     st.header("Синхронизация данных")
     _render_sync_controls()
 
-st.title("CV Matching System + test ci/cd")
+st.title("CV Matching System")
 
 st.subheader("Поиск кандидатов по требованиям")
 
