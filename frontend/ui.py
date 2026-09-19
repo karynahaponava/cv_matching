@@ -37,9 +37,14 @@ def _get_sync_status() -> tuple[str | None, str | None, str | None, str | None]:
     try:
         response = _api_get("/sync-status")
         if not response.ok:
-            return None, None, None, api_error_message(
-                response,
-                "Не удалось получить статус синхронизации",
+            return (
+                None,
+                None,
+                None,
+                api_error_message(
+                    response,
+                    "Не удалось получить статус синхронизации",
+                ),
             )
 
         payload = response.json()
@@ -319,7 +324,9 @@ def _render_sync_controls():
                     st.error(f"Ошибка бэкенда: {message or 'некорректный ответ'}")
                 else:
                     st.error(
-                        api_error_message(response, "Не удалось запустить синхронизацию")
+                        api_error_message(
+                            response, "Не удалось запустить синхронизацию"
+                        )
                     )
             except (requests.RequestException, ValueError) as exc:
                 st.error(f"Ошибка подключения к API: {exc}")
