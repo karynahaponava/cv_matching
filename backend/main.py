@@ -1108,17 +1108,28 @@ def semantic_match(request: SemanticMatchRequest):
         if not matched_cands:
             return paginated_response([], request.page, request.page_size, total)
 
-        names = list(set([c.name for c, _ in matched_cands]))
-        all_cands = (
-            session.query(Candidate.id, Candidate.name, Candidate.cv_url)
-            .filter(Candidate.name.in_(names))
-            .all()
-        )
+        def normalize_name(name: str) -> str:
+            if not name:
+                return ""
+            
+            clean_name = name.lower().replace('ё', 'е').strip()
+            
+            words = clean_name.split()
+            
+            words = ["даниил" if w == "данил" else w for w in words]
+            
+            return " ".join(sorted(words))
+
+        target_norm_names = set([normalize_name(c.name) for c, _ in matched_cands])
+
+        all_cands = session.query(Candidate.id, Candidate.name, Candidate.cv_url).all()
 
         name_to_ids, id_to_url = {}, {}
         for c_id, c_name, c_url in all_cands:
-            name_to_ids.setdefault(c_name, []).append(c_id)
-            id_to_url[c_id] = c_url
+            norm_name = normalize_name(c_name)
+            if norm_name in target_norm_names:
+                name_to_ids.setdefault(norm_name, []).append(c_id)
+                id_to_url[c_id] = c_url
 
         all_ids = [cid for ids in name_to_ids.values() for cid in ids]
         subs = (
@@ -1130,7 +1141,8 @@ def semantic_match(request: SemanticMatchRequest):
 
         results = []
         for c, score in matched_cands:
-            c_ids = name_to_ids.get(c.name, [])
+            norm_c_name = normalize_name(c.name)
+            c_ids = name_to_ids.get(norm_c_name, [])
             c_subs = [s for s in subs if s.candidate_id in c_ids]
             badge_color, badge_text = get_candidate_badge(c.id, c_subs, tc, tb)
             results.append(
