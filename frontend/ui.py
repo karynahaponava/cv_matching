@@ -396,70 +396,63 @@ selected_depts = st.multiselect(
     on_change=_reset_search_results,
 )
 
-fuzzy_enabled = st.checkbox(
-    "Включить нечёткий поиск (поиск опечаток)",
-    value=False,
-    on_change=_reset_search_results,
-)
-semantic_enabled = st.checkbox(
-    "Включить семантический ИИ-поиск (искать по смыслу)",
-    value=True,
-    on_change=_reset_search_results,
-)
+fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
 
 if st.button("Начать поиск", type="primary"):
     q = query.strip()
     if not q:
         st.warning("Пожалуйста, введите требования для поиска.")
-        _reset_search_results()
+        st.session_state.search_results = None
     else:
+        st.session_state.display_limit = 50
         with st.spinner("Ищу подходящих кандидатов..."):
             try:
-                if semantic_enabled:
-                    context = {
-                        "mode": "semantic",
-                        "query": q,
-                        "target_client": target_client.strip(),
-                        "target_broker": target_broker.strip(),
-                        "departments": list(selected_depts),
-                    }
-                elif fuzzy_enabled:
+                if fuzzy_enabled:
                     keywords = _extract_keywords(q)
                     if not keywords:
                         st.warning("Не удалось выделить ключевые слова.")
-                        _reset_search_results()
-                        st.stop()
-                    context = {
-                        "mode": "fuzzy",
-                        "query": q,
-                        "keywords": keywords,
-                        "target_client": target_client.strip(),
-                        "target_broker": target_broker.strip(),
-                        "departments": list(selected_depts),
-                    }
+                        st.session_state.search_results = None
+                    else:
+                        resp = _api_post(
+                            "/fuzzy-match",
+                            payload={
+                                "keywords": keywords,
+                                "target_client": target_client.strip(),
+                                "target_broker": target_broker.strip(),
+                                "departments": selected_depts,
+                            },
+                        )
+                        if resp.ok:
+                            data = resp.json()
+                            st.session_state.search_results = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                            st.session_state.last_query = q
+                            st.session_state.is_fuzzy = True
+                        else:
+                            st.error(f"Ошибка нечёткого поиска: {resp.status_code}")
+                            st.session_state.search_results = None
+                
                 else:
-                    context = {
-                        "mode": "classic",
-                        "query": q,
-                        "target_client": target_client.strip(),
-                        "target_broker": target_broker.strip(),
-                        "departments": list(selected_depts),
-                    }
+                    resp = _api_post(
+                        "/semantic-match",
+                        payload={
+                            "query": q,
+                            "target_client": target_client.strip(),
+                            "target_broker": target_broker.strip(),
+                            "departments": selected_depts,
+                        },
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        st.session_state.search_results = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                        st.session_state.last_query = q
+                        st.session_state.is_fuzzy = False
+                    else:
+                        st.error(f"Ошибка семантического поиска: {resp.status_code}")
+                        st.session_state.search_results = None
 
-                resp = _fetch_search_page(context, page=1)
-                if resp.ok:
-                    data = resp.json()
-                    st.session_state.search_results = data.get("items", [])
-                    st.session_state.search_pagination = data.get("pagination", {})
-                    st.session_state.search_context = context
-                    st.session_state.last_query = q
-                    st.session_state.is_fuzzy = context["mode"] == "fuzzy"
-                else:
-                    st.error(api_error_message(resp, "Ошибка поиска"))
-                    _reset_search_results()
             except Exception as e:
                 st.error(f"Не удалось связаться с сервером API: {e}")
-                _reset_search_results()
+                st.session_state.search_results = None
 
 if st.session_state.search_results is not None:
     st.write("---")
