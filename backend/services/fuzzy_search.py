@@ -91,9 +91,15 @@ def get_candidate_badge(current_cv_id, all_subs, tc, tb):
 
         if result in ("failed", "choose other candidate"):
             target_way = f"через брокера {tb.upper()}" if tb else "напрямую"
+            
+            if alt_broker == tc.upper() or alt_broker == "НАПРЯМУЮ":
+                broker_text = "напрямую"
+            else:
+                broker_text = f"через {alt_broker}"
+                
             return (
                 "green",
-                f"Ранее был отказ от {tc.upper()} (подача шла через {alt_broker}) — можно подать {target_way}{suffix}",
+                f"Ранее был отказ от {tc.upper()} (подача шла {broker_text}) — можно подать {target_way}{suffix}",
             )
 
         target_way = f"через брокера {tb.upper()}" if tb else "напрямую"
@@ -113,12 +119,18 @@ def get_candidate_badge(current_cv_id, all_subs, tc, tb):
         if result == "succeeded":
             return (
                 "red",
-                f"Уже трудоустроен через брокера {tb.upper()} на проект {alt_client}",
+                f"Уже трудоустроен через брокера {tb.upper()} на проект {alt_client}{suffix}",
+            )
+
+        if result in ("failed", "choose other candidate"):
+            return (
+                "green",
+                f"Был отказ от {alt_client} (через {tb.upper()}). Для {tc.upper()} можно подать{suffix}",
             )
 
         return (
-            "green",
-            f"Работает с {tb.upper()} на проекте {alt_client}. Для {tc.upper()} кандидат чист — можно подать{suffix}",
+            "yellow",
+            f"Сейчас на рассмотрении в {alt_client} через {tb.upper()}. Для {tc.upper()} можно подавать параллельно{suffix}",
         )
 
     # ==========================================================
