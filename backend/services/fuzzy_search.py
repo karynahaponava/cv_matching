@@ -123,14 +123,16 @@ def get_candidate_badge(current_cv_id, all_subs, tc, tb):
             )
 
         if result in ("failed", "choose other candidate"):
+            tc_text = f"Для {tc.upper()} можно" if tc else "Можно"
             return (
                 "green",
-                f"Был отказ от {alt_client} (через {tb.upper()}). Для {tc.upper()} можно подать{suffix}",
+                f"Был отказ от {alt_client} (через {tb.upper()}). {tc_text} подать{suffix}",
             )
 
+        tc_text = f"Для {tc.upper()} можно" if tc else "Можно"
         return (
             "yellow",
-            f"Сейчас на рассмотрении в {alt_client} через {tb.upper()}. Для {tc.upper()} можно подавать параллельно{suffix}",
+            f"Сейчас на рассмотрении в {alt_client} через {tb.upper()}. {tc_text} подавать параллельно{suffix}",
         )
 
     # ==========================================================
