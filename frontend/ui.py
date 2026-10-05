@@ -198,6 +198,14 @@ def _reset_search_results():
     st.session_state.search_pagination = None
     st.session_state.search_context = None
 
+def _reset_filters():
+    st.session_state.search_query_input = ""
+    st.session_state.target_client_input = ""
+    st.session_state.target_broker_input = ""
+    st.session_state.selected_depts_input = []
+    st.session_state.fuzzy_enabled_input = False
+    _reset_search_results()
+
 
 def _fetch_search_page(context: dict, page: int) -> requests.Response:
     common = {"page": page, "page_size": 50}
@@ -396,9 +404,23 @@ selected_depts = st.multiselect(
     on_change=_reset_search_results,
 )
 
-fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False)
+fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False, key="fuzzy_enabled_input")
 
-if st.button("Начать поиск", type="primary"):
+btn_col1, btn_col2 = st.columns(2)
+with btn_col1:
+    search_clicked = st.button(
+        "Начать поиск",
+        type="primary",
+        use_container_width=True,
+    )
+with btn_col2:
+    st.button(
+        "Сбросить фильтры",
+        on_click=_reset_filters,
+        use_container_width=True,
+    )
+
+if search_clicked:
     q = query.strip()
     if not q:
         st.warning("Пожалуйста, введите требования для поиска.")
@@ -430,7 +452,6 @@ if st.button("Начать поиск", type="primary"):
                         else:
                             st.error(f"Ошибка нечёткого поиска: {resp.status_code}")
                             st.session_state.search_results = None
-                
                 else:
                     resp = _api_post(
                         "/semantic-match",
