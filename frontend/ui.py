@@ -117,9 +117,6 @@ def _extract_keywords(query: str) -> list[str]:
     kws = [k for k in _KW_RE.findall(q) if len(k) >= 1]
     return list(dict.fromkeys(kws))[:30]
 
-
-import difflib
-
 import difflib
 
 def _highlight_stack(stack: str, query: str) -> str:
@@ -320,8 +317,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment")
+_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
 
+if _fragment is None:
+    def _fragment(**kwargs):
+        return lambda func: func
 
 @_fragment(run_every="3s")
 def _render_sync_controls():
@@ -483,6 +483,14 @@ if search_clicked:
                             st.session_state.search_results = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
                             st.session_state.last_query = q
                             st.session_state.is_fuzzy = True
+                            st.session_state.search_context = {
+                                "mode": "fuzzy",
+                                "query": q,
+                                "keywords": keywords,
+                                "target_client": target_client.strip(),
+                                "target_broker": target_broker.strip(),
+                                "departments": selected_depts,
+                            }
                         else:
                             st.error(f"Ошибка нечёткого поиска: {resp.status_code}")
                             st.session_state.search_results = None
@@ -501,6 +509,13 @@ if search_clicked:
                         st.session_state.search_results = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
                         st.session_state.last_query = q
                         st.session_state.is_fuzzy = False
+                        st.session_state.search_context = {
+                                "mode": "semantic",
+                                "query": q,
+                                "target_client": target_client.strip(),
+                                "target_broker": target_broker.strip(),
+                                "departments": selected_depts,
+                            }
                     else:
                         st.error(f"Ошибка семантического поиска: {resp.status_code}")
                         st.session_state.search_results = None
