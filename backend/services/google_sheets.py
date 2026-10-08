@@ -120,6 +120,7 @@ def sync_candidates_from_cloud(session):
         skipped_count = 0
 
         for _, row in df.iterrows():
+            registration = str(row.get("Registration", "")).strip()
             cv_url = str(row.get("Link", "")).strip()
             name = str(row.get("Candidate", "")).strip()
 
@@ -171,6 +172,7 @@ def sync_candidates_from_cloud(session):
                     stack="",
                     seniority="",
                     created_at=submitted_at,
+                    registration=registration,
                 )
                 session.add(cand)
                 session.flush()
@@ -182,6 +184,9 @@ def sync_candidates_from_cloud(session):
                     cand_updated = True
                 if cand.direction != department:
                     cand.direction = department
+                    cand_updated = True
+                if getattr(cand, "registration", "") != registration:
+                    cand.registration = registration
                     cand_updated = True
                 if submitted_at and cand.created_at != submitted_at:
                     cand.created_at = submitted_at

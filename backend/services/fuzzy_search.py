@@ -142,6 +142,7 @@ def fuzzy_search_candidates(
     target_broker: str = None,
     threshold: float = 0.3,
     departments: list[str] | None = None,
+    location: str = "",
     page: int = 1,
     page_size: int = 50,
 ) -> tuple[list[dict], int]:
@@ -185,6 +186,9 @@ def fuzzy_search_candidates(
                 AND (
                     COALESCE(cardinality(CAST(:departments AS text[])), 0) = 0
                     OR c.direction = ANY(CAST(:departments AS text[]))
+                )
+                AND (
+                    :location = '' OR c.registration = :location
                 )
             LIMIT 100
         ),
@@ -233,6 +237,7 @@ def fuzzy_search_candidates(
         params = {
             "threshold": threshold,
             "departments": cleaned_departments,
+            "location": location if location and location != "Все" else "", 
             "limit": page_size,
             "offset": (page - 1) * page_size,
         }
