@@ -1,17 +1,11 @@
+import time
 from datetime import datetime, timedelta
-from sqlalchemy import text
-from database.models import Candidate, Submission
 from database.db import SessionLocal
-
-from datetime import datetime, timedelta
+from database.models import Candidate, Submission
+from sqlalchemy import text
 
 
 def get_candidate_badge(current_cv_id, all_subs, tc, tb):
-    """
-    1. Ищет точное пересечение введённого клиента и введённого брокера.
-    2. Если точного совпадения нет, смотрит историю по клиенту.
-    3. Если по клиенту чисто, смотрит историю по брокеру.
-    """
     if not tc and not tb:
         return None, None
 
@@ -49,9 +43,6 @@ def get_candidate_badge(current_cv_id, all_subs, tc, tb):
             return " [по этому же резюме]"
         return f" [по резюме: {url}]"
 
-    # ==========================================================
-    # КЕЙС 1: Есть ТОЧНОЕ совпадение связки (Клиент + Брокер), которую ищет сейлз
-    # ==========================================================
     if exact_subs:
         latest = exact_subs[0]
         result = (latest.request_result or "").strip().lower()
@@ -74,9 +65,6 @@ def get_candidate_badge(current_cv_id, all_subs, tc, tb):
             f"Сейчас в процессе в {tc.upper()} через {tb.upper()} — можно переподать{suffix}",
         )
 
-    # ==========================================================
-    # КЕЙС 2: Точной связки нет, но кандидат подавался к этому КЛИЕНТУ (через другого брокера)
-    # ==========================================================
     if client_subs:
         latest = client_subs[0]
         alt_broker = (latest.intermediary or "напрямую").upper()
@@ -91,12 +79,12 @@ def get_candidate_badge(current_cv_id, all_subs, tc, tb):
 
         if result in ("failed", "choose other candidate"):
             target_way = f"через брокера {tb.upper()}" if tb else "напрямую"
-            
+
             if alt_broker == tc.upper() or alt_broker == "НАПРЯМУЮ":
                 broker_text = "напрямую"
             else:
                 broker_text = f"через {alt_broker}"
-                
+
             return (
                 "green",
                 f"Ранее был отказ от {tc.upper()} (подача шла {broker_text}) — можно подать {target_way}{suffix}",
@@ -107,9 +95,7 @@ def get_candidate_badge(current_cv_id, all_subs, tc, tb):
             "yellow",
             f"Сейчас в процессе в {tc.upper()} через {alt_broker} — можно переподать {target_way}{suffix}",
         )
-    # ==========================================================
-    # КЕЙС 3: К клиенту не подавался, но есть история работы с этим БРОКЕРОМ
-    # ==========================================================
+
     if broker_subs:
         latest = broker_subs[0]
         alt_client = (latest.end_client or "другой проект").upper()
@@ -135,9 +121,6 @@ def get_candidate_badge(current_cv_id, all_subs, tc, tb):
             f"Сейчас на рассмотрении в {alt_client} через {tb.upper()}. {tc_text} подавать параллельно{suffix}",
         )
 
-    # ==========================================================
-    # КЕЙС 4: Абсолютно чистый кандидат
-    # ==========================================================
     if tc and tb:
         return (
             "green",
@@ -162,7 +145,15 @@ def fuzzy_search_candidates(
     page: int = 1,
     page_size: int = 50,
 ) -> tuple[list[dict], int]:
-    cleaned = [k.strip().lower() for k in keywords if k and k.strip()]
+    t_start = time.time()
+
+    tokens = []
+    for k in keywords:
+        if k and k.strip():
+            words = [w.strip().lower() for w in k.strip().split() if len(w.strip()) > 2]
+            tokens.extend(words)
+
+    cleaned_tokens = list(dict.fromkeys(tokens))
 
     cleaned_departments = [
         department.strip()
@@ -170,45 +161,61 @@ def fuzzy_search_candidates(
         if department and department.strip()
     ]
 
-    if not cleaned:
+    if not cleaned_tokens:
         return [], 0
 
-    cte = r"""
-        WITH kw AS (
-            SELECT unnest(CAST(:keywords AS text[])) AS keyword
+    def safe_literal(val: str) -> str:
+        return "'" + val.replace("'", "''") + "'"
+
+    literals = [safe_literal(t) for t in cleaned_tokens]
+    keywords_array_sql = f"ARRAY[{', '.join(literals)}]"
+
+    word_conditions = []
+    for lit in literals:
+        word_conditions.append(f"(c.cv_text %> {lit} OR c.stack %> {lit})")
+
+    index_where_clause = " OR ".join(word_conditions)
+
+    cte = f"""
+        WITH matched_candidates AS (
+            SELECT c.id, c.name, c.cv_url, c.stack, c.cv_text
+            FROM candidates c
+            WHERE 
+                ({index_where_clause})
+                AND (
+                    COALESCE(cardinality(CAST(:departments AS text[])), 0) = 0
+                    OR c.direction = ANY(CAST(:departments AS text[]))
+                )
+            LIMIT 100
+        ),
+        kw AS (
+            SELECT unnest({keywords_array_sql}) AS keyword
         ),
         per_keyword AS (
             SELECT
-                c.id, c.name, c.cv_url, c.stack,
+                mc.id, mc.name, mc.cv_url, mc.stack,
                 GREATEST(
-                    -- Проверка на точное совпадение целого слова (без эффекта Django)
-                    CASE WHEN c.stack ~* ('\m' || kw.keyword || '\M') THEN 1.0 ELSE 0.0 END,
-                    CASE WHEN c.cv_text ~* ('\m' || kw.keyword || '\M') THEN 1.0 ELSE 0.0 END,
-                    -- Нечеткий поиск (прощает опечатки)
-                    word_similarity(kw.keyword, lower(COALESCE(c.stack, ''))),
-                    word_similarity(kw.keyword, lower(COALESCE(c.cv_text, '')))
+                    word_similarity(kw.keyword, lower(COALESCE(mc.stack, ''))),
+                    word_similarity(kw.keyword, lower(COALESCE(mc.cv_text, '')))
                 ) AS sim
-            FROM candidates c
+            FROM matched_candidates mc
             CROSS JOIN kw
-            WHERE (
-                COALESCE(cardinality(CAST(:departments AS text[])), 0) = 0
-                OR c.direction = ANY(CAST(:departments AS text[]))
-            )
         ),
         aggregated AS (
             SELECT
                 id, name, cv_url, stack,
-                -- Берем СРЕДНЕЕ совпадение по всем введенным словам, а не максимум
                 AVG(sim) AS final_sim
             FROM per_keyword
             GROUP BY id, name, cv_url, stack
         )
     """
+
     count_sql = text(cte + """
         SELECT COUNT(*)
         FROM aggregated
         WHERE final_sim >= :threshold
     """)
+
     page_sql = text(cte + """
         SELECT
             a.id, a.name, a.cv_url, a.stack,
@@ -221,24 +228,25 @@ def fuzzy_search_candidates(
 
     session = SessionLocal()
     try:
+        session.execute(text("SET LOCAL pg_trgm.word_similarity_threshold = 0.2"))
+
         params = {
-            "keywords": cleaned,
             "threshold": threshold,
             "departments": cleaned_departments,
             "limit": page_size,
             "offset": (page - 1) * page_size,
         }
+
+        t_sql_start = time.time()
         total = int(session.execute(count_sql, params).scalar() or 0)
-        rows = (
-            session.execute(
-                page_sql,
-                params,
-            )
-            .mappings()
-            .all()
-        )
+        rows = session.execute(page_sql, params).mappings().all()
+        t_sql_end = time.time()
+        print(f"⏱ [BACKEND] SQL Execution Time: {t_sql_end - t_sql_start:.3f} sec")
+
         if not rows:
             return [], total
+
+        t_py_start = time.time()
 
         names = list(set([r["name"] for r in rows]))
         all_cands = (
@@ -283,6 +291,11 @@ def fuzzy_search_candidates(
                     "badge_text": badge_text,
                 }
             )
+
+        t_py_end = time.time()
+        print(f"⏱ [BACKEND] Python Processing Time: {t_py_end - t_py_start:.3f} sec")
+        print(f"⏱ [BACKEND] TOTAL Function Time: {t_py_end - t_start:.3f} sec\n")
+
         return results, total
     finally:
         session.close()
