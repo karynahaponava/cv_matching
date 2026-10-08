@@ -118,22 +118,56 @@ def _extract_keywords(query: str) -> list[str]:
     return list(dict.fromkeys(kws))[:30]
 
 
+import difflib
+
+import difflib
+
 def _highlight_stack(stack: str, query: str) -> str:
     stack_raw = stack or ""
-    stack_l = stack_raw.lower()
-
-    keywords = [kw for kw in _extract_keywords(query) if kw in stack_l]
-    if not keywords:
+    if not stack_raw.strip() or not query.strip():
         return html.escape(stack_raw)
 
-    escaped = html.escape(stack_raw)
-    for kw in sorted(set(keywords), key=len, reverse=True):
-        pattern = re.compile(rf"(?i)(?<!\w)({re.escape(kw)})(?!\w)")
-        escaped = pattern.sub(
-            r'<mark style="background-color: #d4edda; color: #155724;">\1</mark>',
-            escaped,
-        )
-    return escaped
+    query_lower = query.lower()
+    query_words = [w.lower() for w in re.findall(r"[a-zA-Zа-яА-Я0-9+#\.\-_/]+", query) if len(w) >= 3]
+
+    items = stack_raw.split(",")
+    rendered_items = []
+
+    for item in items:
+        item_stripped = item.strip()
+        if not item_stripped:
+            rendered_items.append(html.escape(item))
+            continue
+
+        item_lower = item_stripped.lower()
+        matched = False
+
+        if len(item_lower) <= 3:
+            pattern = re.compile(rf"(?i)(?<![a-zA-Z0-9_]){re.escape(item_lower)}(?![a-zA-Z0-9_])")
+            if pattern.search(query_lower):
+                matched = True
+        else:
+            if item_lower in query_lower:
+                matched = True
+            else:
+                for qw in query_words:
+                    ratio = difflib.SequenceMatcher(None, item_lower, qw).ratio()
+                    if ratio >= 0.78:
+                        matched = True
+                        break
+
+        escaped_text = html.escape(item_stripped)
+        
+        leading_spaces = item[:len(item) - len(item.lstrip())]
+        trailing_spaces = item[len(item.rstrip()):]
+
+        if matched:
+            highlighted = f'{leading_spaces}<mark style="background-color: #d4edda; color: #155724; font-weight: bold; padding: 0 4px; border-radius: 3px;">{escaped_text}</mark>{trailing_spaces}'
+            rendered_items.append(highlighted)
+        else:
+            rendered_items.append(html.escape(item))
+
+    return ",".join(rendered_items)
 
 
 def _render_search_results(
