@@ -161,6 +161,7 @@ class FuzzyMatchRequest(PaginationRequest):
     target_client: str = ""
     target_broker: str = ""
     departments: list[str] = Field(default_factory=list, max_length=10)
+    registration: str = ""
 
     @field_validator("keywords")
     @classmethod
@@ -175,6 +176,7 @@ class SemanticMatchRequest(PaginationRequest):
     target_client: str = ""
     target_broker: str = ""
     departments: list[str] = Field(default_factory=list, max_length=10)
+    registration: str = ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -1052,6 +1054,7 @@ def fuzzy_match(request: FuzzyMatchRequest):
             target_broker=request.target_broker,
             threshold=request.threshold,
             departments=request.departments,
+            location=request.registration,
             page=request.page,
             page_size=request.page_size,
         )
@@ -1083,6 +1086,9 @@ def semantic_match(request: SemanticMatchRequest):
 
         if request.departments:
             db_query = db_query.filter(Candidate.direction.in_(request.departments))
+
+        if request.registration and request.registration != "Все":
+            db_query = db_query.filter(Candidate.registration == request.registration)
 
         candidates = db_query.all()
 
