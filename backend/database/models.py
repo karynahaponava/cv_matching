@@ -33,6 +33,7 @@ class Candidate(Base):
     parsed_with_version = Column(Integer, nullable=True)
     cv_source_check_failures = Column(Integer, nullable=False, default=0)
     cv_source_next_check_at = Column(DateTime, nullable=True)
+    registration = Column(String, nullable=True)
 
     @validates('created_at')
     def validate_created_at(self, key, value):

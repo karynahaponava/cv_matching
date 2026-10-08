@@ -234,6 +234,7 @@ def _reset_filters():
     st.session_state.target_client_input = ""
     st.session_state.target_broker_input = ""
     st.session_state.selected_depts_input = []
+    st.session_state.selected_registration_input = "Все"
     st.session_state.fuzzy_enabled_input = False
     _reset_search_results()
 
@@ -249,6 +250,7 @@ def _fetch_search_page(context: dict, page: int) -> requests.Response:
                 "target_client": context["target_client"],
                 "target_broker": context["target_broker"],
                 "departments": context["departments"],
+                "registration": context.get("registration", ""),
             },
         )
     if context["mode"] == "fuzzy":
@@ -260,11 +262,12 @@ def _fetch_search_page(context: dict, page: int) -> requests.Response:
                 "target_client": context["target_client"],
                 "target_broker": context["target_broker"],
                 "departments": context["departments"],
+                "registration": context.get("registration", ""),
             },
         )
     return _api_get(
         "/search",
-        params={**common, "query": context["query"]},
+        params={**common, "query": context["query"], "registration": context.get("registration", "")},
     )
 
 
@@ -438,6 +441,13 @@ selected_depts = st.multiselect(
     on_change=_reset_search_results,
 )
 
+selected_registration = st.selectbox(
+    "Локация / Гражданство",
+    options=["Все", "РФ", "РБ"],
+    key="selected_registration_input",
+    on_change=_reset_search_results,
+)
+
 fuzzy_enabled = st.checkbox("Включить нечёткий поиск (поиск опечаток)", value=False, key="fuzzy_enabled_input")
 
 btn_col1, btn_col2 = st.columns(2)
@@ -476,6 +486,7 @@ if search_clicked:
                                 "target_client": target_client.strip(),
                                 "target_broker": target_broker.strip(),
                                 "departments": selected_depts,
+                                "registration": selected_registration,
                             },
                         )
                         if resp.ok:
@@ -502,6 +513,7 @@ if search_clicked:
                             "target_client": target_client.strip(),
                             "target_broker": target_broker.strip(),
                             "departments": selected_depts,
+                            "registration": selected_registration,
                         },
                     )
                     if resp.ok:
@@ -515,6 +527,7 @@ if search_clicked:
                                 "target_client": target_client.strip(),
                                 "target_broker": target_broker.strip(),
                                 "departments": selected_depts,
+                                "registration": selected_registration,
                             }
                     else:
                         st.error(f"Ошибка семантического поиска: {resp.status_code}")
